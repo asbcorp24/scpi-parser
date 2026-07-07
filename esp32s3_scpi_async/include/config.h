@@ -7,8 +7,18 @@
 #define I2C_SCL_PIN 18
 #define I2C_FREQ_HZ 400000
 
-// MCP23017 I2C address. Usually 0x20 when A0/A1/A2 are GND.
-#define MCP23017_ADDR 0x20
+// Four MCP23017 expanders on one I2C bus.
+// Address is selected by A0/A1/A2 pins:
+// MCP0: 0x20 = A2=GND A1=GND A0=GND, global pins 0..15
+// MCP1: 0x21 = A2=GND A1=GND A0=VCC, global pins 16..31
+// MCP2: 0x22 = A2=GND A1=VCC A0=GND, global pins 32..47
+// MCP3: 0x23 = A2=GND A1=VCC A0=VCC, global pins 48..63
+#define MCP23017_COUNT 4
+#define MCP23017_ADDR0 0x20
+#define MCP23017_ADDR1 0x21
+#define MCP23017_ADDR2 0x22
+#define MCP23017_ADDR3 0x23
+#define MCP_TOTAL_PINS (MCP23017_COUNT * 16)
 
 // OLED GM009605 / SSD1306 settings
 #define OLED_ADDR 0x3C
@@ -37,7 +47,7 @@
 #define DEVICE_MANUFACTURER "ASBCORP"
 #define DEVICE_MODEL "ESP32S3-SCPI-ASYNC-GPIO"
 #define DEVICE_SERIAL "N8R2"
-#define DEVICE_VERSION "0.3-psram-long-scpi"
+#define DEVICE_VERSION "0.4-4mcp-console"
 
 // Long SCPI command line length.
 // Allocated from PSRAM with heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT).
