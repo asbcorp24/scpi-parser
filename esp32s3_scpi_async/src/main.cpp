@@ -8,12 +8,26 @@
 #include <Adafruit_SSD1306.h>
 #include "config.h"
 
+// Compatibility wrapper for ESP32 Arduino core.
+// EthernetServer from arduino-libraries/Ethernet has begin(), while ESP32 Server
+// declares pure virtual begin(uint16_t). Without this wrapper EthernetServer is
+// abstract on ESP32-S3.
+class EthernetServerCompat : public EthernetServer {
+public:
+  explicit EthernetServerCompat(uint16_t port) : EthernetServer(port) {}
+
+  void begin(uint16_t port = 0) override {
+    (void)port;
+    EthernetServer::begin();
+  }
+};
+
 SCPI_Parser scpiSerial;
 SCPI_Parser scpiEth;
 
 Adafruit_MCP23X17 mcp;
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
-EthernetServer scpiServer(SCPI_TCP_PORT);
+EthernetServerCompat scpiServer(SCPI_TCP_PORT);
 EthernetClient ethClients[MAX_ETH_CLIENTS];
 
 SemaphoreHandle_t scpiMutex;
@@ -74,19 +88,34 @@ static bool parseIntStrict(const char *s, int &out) {
 
 static bool parseDigital(const char *s, int &out) {
   String v = uptrim(s);
-  if (v == "1" || v == "ON" || v == "HIGH") { out = HIGH; return true; }
-  if (v == "0" || v == "OFF" || v == "LOW") { out = LOW; return true; }
+  if (v == "1" || v == "ON" || v == "HIGH") {
+    out = HIGH;
+    return true;
+  }
+  if (v == "0" || v == "OFF" || v == "LOW") {
+    out = LOW;
+    return true;
+  }
   return false;
 }
 
 static bool isEspPinAllowed(int pin) {
   if (pin < 0 || pin > 48) return false;
+
+  // Boot strapping pins.
   if (pin == 0 || pin == 3 || pin == 45 || pin == 46) return false;
+
+  // Native USB D-/D+.
   if (pin == 19 || pin == 20) return false;
+
+  // Often used by Flash/PSRAM on ESP32-S3 modules.
   if (pin >= 26 && pin <= 37) return false;
+
+  // Project buses.
   if (pin == I2C_SDA_PIN || pin == I2C_SCL_PIN) return false;
   if (pin == W5500_SCK_PIN || pin == W5500_MISO_PIN || pin == W5500_MOSI_PIN) return false;
   if (pin == W5500_CS_PIN || pin == W5500_RST_PIN) return false;
+
   return true;
 }
 
@@ -108,39 +137,60 @@ static bool parseMcpPin(const char *s, int &pin) {
 
 static void incCounter(bool eth, const char *src) {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (eth) ethCount++; else serialCount++;
+  if (eth) ethCount++;
+  else serialCount++;
   lastSource = src;
   xSemaphoreGive(stateMutex);
 }
 
 static void setEspMode(int pin, const String &mode, Stream &io) {
-  if (mode == "OUT" || mode == "OUTPUT") pinMode(pin, OUTPUT);
-  else if (mode == "IN" || mode == "INPUT") pinMode(pin, INPUT);
-  else if (mode == "INPULLUP" || mode == "INPUT_PULLUP" || mode == "PULLUP") pinMode(pin, INPUT_PULLUP);
-  else if (mode == "INPULLDOWN" || mode == "INPUT_PULLDOWN" || mode == "PULLDOWN") pinMode(pin, INPUT_PULLDOWN);
-  else { replyErr(io, "unknown ESP GPIO mode"); return; }
+  if (mode == "OUT" || mode == "OUTPUT") {
+    pinMode(pin, OUTPUT);
+  } else if (mode == "IN" || mode == "INPUT") {
+    pinMode(pin, INPUT);
+  } else if (mode == "INPULLUP" || mode == "INPUT_PULLUP" || mode == "PULLUP") {
+    pinMode(pin, INPUT_PULLUP);
+  } else if (mode == "INPULLDOWN" || mode == "INPUT_PULLDOWN" || mode == "PULLDOWN") {
+    pinMode(pin, INPUT_PULLDOWN);
+  } else {
+    replyErr(io, "unknown ESP GPIO mode");
+    return;
+  }
+
   io.println(F("OK"));
 }
 
 static void setMcpMode(int pin, const String &mode, Stream &io) {
-  if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
+  if (!mcpReady) {
+    replyErr(io, "MCP23017 not initialized");
+    return;
+  }
+
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  if (mode == "OUT" || mode == "OUTPUT") mcp.pinMode(pin, OUTPUT);
-  else if (mode == "IN" || mode == "INPUT") mcp.pinMode(pin, INPUT);
-  else if (mode == "INPULLUP" || mode == "INPUT_PULLUP" || mode == "PULLUP") mcp.pinMode(pin, INPUT_PULLUP);
-  else {
+
+  if (mode == "OUT" || mode == "OUTPUT") {
+    mcp.pinMode(pin, OUTPUT);
+  } else if (mode == "IN" || mode == "INPUT") {
+    mcp.pinMode(pin, INPUT);
+  } else if (mode == "INPULLUP" || mode == "INPUT_PULLUP" || mode == "PULLUP") {
+    mcp.pinMode(pin, INPUT_PULLUP);
+  } else {
     xSemaphoreGive(i2cMutex);
     replyErr(io, "unknown MCP mode");
     return;
   }
+
   xSemaphoreGive(i2cMutex);
   io.println(F("OK"));
 }
 
 void cmdIDN(SCPI_C, SCPI_P, Stream &io) {
-  io.print(DEVICE_MANUFACTURER); io.print(',');
-  io.print(DEVICE_MODEL); io.print(',');
-  io.print(DEVICE_SERIAL); io.print(',');
+  io.print(DEVICE_MANUFACTURER);
+  io.print(',');
+  io.print(DEVICE_MODEL);
+  io.print(',');
+  io.print(DEVICE_SERIAL);
+  io.print(',');
   io.println(DEVICE_VERSION);
 }
 
@@ -172,18 +222,29 @@ void cmdErr(SCPI_C, SCPI_P, Stream &io) {
 
 void cmdStat(SCPI_C, SCPI_P, Stream &io) {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  bool er = ethReady, mr = mcpReady, orr = oledReady;
+  bool er = ethReady;
+  bool mr = mcpReady;
+  bool orr = oledReady;
   IPAddress ip = currentIp;
-  uint32_t sc = serialCount, ec = ethCount;
+  uint32_t sc = serialCount;
+  uint32_t ec = ethCount;
   String src = lastSource;
   xSemaphoreGive(stateMutex);
-  io.print(F("ETH=")); io.print(er ? F("1") : F("0"));
-  io.print(F(",IP=")); io.print(ip);
-  io.print(F(",MCP=")); io.print(mr ? F("1") : F("0"));
-  io.print(F(",OLED=")); io.print(orr ? F("1") : F("0"));
-  io.print(F(",SERIAL_CMDS=")); io.print(sc);
-  io.print(F(",ETH_CMDS=")); io.print(ec);
-  io.print(F(",LAST=")); io.println(src);
+
+  io.print(F("ETH="));
+  io.print(er ? F("1") : F("0"));
+  io.print(F(",IP="));
+  io.print(ip);
+  io.print(F(",MCP="));
+  io.print(mr ? F("1") : F("0"));
+  io.print(F(",OLED="));
+  io.print(orr ? F("1") : F("0"));
+  io.print(F(",SERIAL_CMDS="));
+  io.print(sc);
+  io.print(F(",ETH_CMDS="));
+  io.print(ec);
+  io.print(F(",LAST="));
+  io.println(src);
 }
 
 void cmdEthIp(SCPI_C, SCPI_P, Stream &io) {
@@ -194,79 +255,170 @@ void cmdEthIp(SCPI_C, SCPI_P, Stream &io) {
 }
 
 void cmdGpioMode(SCPI_C, SCPI_P p, Stream &io) {
-  if (p.Size() < 2) { replyErr(io, "GPIO:MODE needs pin,mode"); return; }
+  if (p.Size() < 2) {
+    replyErr(io, "GPIO:MODE needs pin,mode");
+    return;
+  }
+
   int pin;
-  if (!parseEspPin(p[0], pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
+  if (!parseEspPin(p[0], pin)) {
+    replyErr(io, "bad/protected ESP GPIO pin");
+    return;
+  }
+
   setEspMode(pin, uptrim(p[1]), io);
 }
 
 void cmdGpioWrite(SCPI_C, SCPI_P p, Stream &io) {
-  if (p.Size() < 2) { replyErr(io, "GPIO:WRITE needs pin,value"); return; }
-  int pin, value;
-  if (!parseEspPin(p[0], pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
-  if (!parseDigital(p[1], value)) { replyErr(io, "bad GPIO value"); return; }
+  if (p.Size() < 2) {
+    replyErr(io, "GPIO:WRITE needs pin,value");
+    return;
+  }
+
+  int pin;
+  int value;
+
+  if (!parseEspPin(p[0], pin)) {
+    replyErr(io, "bad/protected ESP GPIO pin");
+    return;
+  }
+
+  if (!parseDigital(p[1], value)) {
+    replyErr(io, "bad GPIO value");
+    return;
+  }
+
   pinMode(pin, OUTPUT);
   digitalWrite(pin, value);
   io.println(F("OK"));
 }
 
 void cmdGpioRead(SCPI_C, SCPI_P p, Stream &io) {
-  if (p.Size() < 1) { replyErr(io, "GPIO:READ? needs pin"); return; }
+  if (p.Size() < 1) {
+    replyErr(io, "GPIO:READ? needs pin");
+    return;
+  }
+
   int pin;
-  if (!parseEspPin(p[0], pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
+  if (!parseEspPin(p[0], pin)) {
+    replyErr(io, "bad/protected ESP GPIO pin");
+    return;
+  }
+
   io.println(digitalRead(pin) ? F("1") : F("0"));
 }
 
 void cmdGpioToggle(SCPI_C, SCPI_P p, Stream &io) {
-  if (p.Size() < 1) { replyErr(io, "GPIO:TOGGLE needs pin"); return; }
+  if (p.Size() < 1) {
+    replyErr(io, "GPIO:TOGGLE needs pin");
+    return;
+  }
+
   int pin;
-  if (!parseEspPin(p[0], pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
+  if (!parseEspPin(p[0], pin)) {
+    replyErr(io, "bad/protected ESP GPIO pin");
+    return;
+  }
+
   pinMode(pin, OUTPUT);
   digitalWrite(pin, !digitalRead(pin));
   io.println(F("OK"));
 }
 
 void cmdMcpMode(SCPI_C, SCPI_P p, Stream &io) {
-  if (p.Size() < 2) { replyErr(io, "MCP:MODE needs pin,mode"); return; }
+  if (p.Size() < 2) {
+    replyErr(io, "MCP:MODE needs pin,mode");
+    return;
+  }
+
   int pin;
-  if (!parseMcpPin(p[0], pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
+  if (!parseMcpPin(p[0], pin)) {
+    replyErr(io, "bad MCP pin, use 0..15");
+    return;
+  }
+
   setMcpMode(pin, uptrim(p[1]), io);
 }
 
 void cmdMcpWrite(SCPI_C, SCPI_P p, Stream &io) {
-  if (p.Size() < 2) { replyErr(io, "MCP:WRITE needs pin,value"); return; }
-  if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  int pin, value;
-  if (!parseMcpPin(p[0], pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
-  if (!parseDigital(p[1], value)) { replyErr(io, "bad MCP value"); return; }
+  if (p.Size() < 2) {
+    replyErr(io, "MCP:WRITE needs pin,value");
+    return;
+  }
+
+  if (!mcpReady) {
+    replyErr(io, "MCP23017 not initialized");
+    return;
+  }
+
+  int pin;
+  int value;
+
+  if (!parseMcpPin(p[0], pin)) {
+    replyErr(io, "bad MCP pin, use 0..15");
+    return;
+  }
+
+  if (!parseDigital(p[1], value)) {
+    replyErr(io, "bad MCP value");
+    return;
+  }
+
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
   mcp.pinMode(pin, OUTPUT);
   mcp.digitalWrite(pin, value);
   xSemaphoreGive(i2cMutex);
+
   io.println(F("OK"));
 }
 
 void cmdMcpRead(SCPI_C, SCPI_P p, Stream &io) {
-  if (p.Size() < 1) { replyErr(io, "MCP:READ? needs pin"); return; }
-  if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
+  if (p.Size() < 1) {
+    replyErr(io, "MCP:READ? needs pin");
+    return;
+  }
+
+  if (!mcpReady) {
+    replyErr(io, "MCP23017 not initialized");
+    return;
+  }
+
   int pin;
-  if (!parseMcpPin(p[0], pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
+  if (!parseMcpPin(p[0], pin)) {
+    replyErr(io, "bad MCP pin, use 0..15");
+    return;
+  }
+
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
   int v = mcp.digitalRead(pin);
   xSemaphoreGive(i2cMutex);
+
   io.println(v ? F("1") : F("0"));
 }
 
 void cmdMcpToggle(SCPI_C, SCPI_P p, Stream &io) {
-  if (p.Size() < 1) { replyErr(io, "MCP:TOGGLE needs pin"); return; }
-  if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
+  if (p.Size() < 1) {
+    replyErr(io, "MCP:TOGGLE needs pin");
+    return;
+  }
+
+  if (!mcpReady) {
+    replyErr(io, "MCP23017 not initialized");
+    return;
+  }
+
   int pin;
-  if (!parseMcpPin(p[0], pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
+  if (!parseMcpPin(p[0], pin)) {
+    replyErr(io, "bad MCP pin, use 0..15");
+    return;
+  }
+
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
   mcp.pinMode(pin, OUTPUT);
   int v = mcp.digitalRead(pin);
   mcp.digitalWrite(pin, !v);
   xSemaphoreGive(i2cMutex);
+
   io.println(F("OK"));
 }
 
@@ -282,14 +434,17 @@ static void registerScpi(SCPI_Parser &p) {
   p.RegisterCommand(F("SYSTem:ERRor?"), &cmdErr);
   p.RegisterCommand(F("SYSTem:STATus?"), &cmdStat);
   p.RegisterCommand(F("ETHernet:IP?"), &cmdEthIp);
+
   p.RegisterCommand(F("GPIO:MODe"), &cmdGpioMode);
   p.RegisterCommand(F("GPIO:WRITe"), &cmdGpioWrite);
   p.RegisterCommand(F("GPIO:READ?"), &cmdGpioRead);
   p.RegisterCommand(F("GPIO:TOGGle"), &cmdGpioToggle);
+
   p.RegisterCommand(F("MCP:MODe"), &cmdMcpMode);
   p.RegisterCommand(F("MCP:WRITe"), &cmdMcpWrite);
   p.RegisterCommand(F("MCP:READ?"), &cmdMcpRead);
   p.RegisterCommand(F("MCP:TOGGle"), &cmdMcpToggle);
+
   p.SetErrorHandler(&cmdUndefined);
   p.timeout = 10;
 }
@@ -298,9 +453,12 @@ static void initI2c() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
 
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
+
   mcpReady = mcp.begin_I2C(MCP23017_ADDR, &Wire);
   if (mcpReady) {
-    for (int i = 0; i < 16; i++) mcp.pinMode(i, INPUT_PULLUP);
+    for (int i = 0; i < 16; i++) {
+      mcp.pinMode(i, INPUT_PULLUP);
+    }
   }
 
   oledReady = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
@@ -313,6 +471,7 @@ static void initI2c() {
     oled.println(F("ESP32-S3 N16R2"));
     oled.display();
   }
+
   xSemaphoreGive(i2cMutex);
 }
 
@@ -327,11 +486,15 @@ static void initW5500() {
   Ethernet.init(W5500_CS_PIN);
 
   int dhcp = Ethernet.begin(macAddress, 5000, 1000);
+
 #if USE_STATIC_IP_IF_DHCP_FAIL
-  if (dhcp == 0) Ethernet.begin(macAddress, fallbackIp, fallbackDns, fallbackGw, fallbackMask);
+  if (dhcp == 0) {
+    Ethernet.begin(macAddress, fallbackIp, fallbackDns, fallbackGw, fallbackMask);
+  }
 #endif
 
   scpiServer.begin();
+
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   currentIp = Ethernet.localIP();
   ethReady = Ethernet.hardwareStatus() != EthernetNoHardware && Ethernet.linkStatus() != LinkOFF;
@@ -346,6 +509,7 @@ void taskSerial(void *) {
       scpiSerial.ProcessInput(Serial, "\n");
       xSemaphoreGive(scpiMutex);
     }
+
     vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
@@ -353,15 +517,20 @@ void taskSerial(void *) {
 static void acceptClient() {
   EthernetClient c = scpiServer.available();
   if (!c) return;
+
   for (int i = 0; i < MAX_ETH_CLIENTS; i++) {
     if (!ethClients[i] || !ethClients[i].connected()) {
-      if (ethClients[i]) ethClients[i].stop();
+      if (ethClients[i]) {
+        ethClients[i].stop();
+      }
+
       ethClients[i] = c;
       ethClients[i].println(F("ESP32-S3 SCPI TCP ready"));
       ethClients[i].println(F("Send HELP?"));
       return;
     }
   }
+
   c.println(F("ERR: too many clients"));
   c.stop();
 }
@@ -411,15 +580,22 @@ void taskOled(void *) {
       oled.setTextColor(SSD1306_WHITE);
       oled.setCursor(0, 0);
       oled.println(F("ESP32-S3 SCPI"));
-      oled.print(F("ETH: ")); oled.println(er ? F("OK") : F("NO"));
-      oled.print(F("IP: ")); oled.println(ip);
-      oled.print(F("MCP: ")); oled.println(mr ? F("OK") : F("NO"));
-      oled.print(F("SER:")); oled.print(sc);
-      oled.print(F(" ETH:")); oled.println(ec);
-      oled.print(F("SRC: ")); oled.println(src);
+      oled.print(F("ETH: "));
+      oled.println(er ? F("OK") : F("NO"));
+      oled.print(F("IP: "));
+      oled.println(ip);
+      oled.print(F("MCP: "));
+      oled.println(mr ? F("OK") : F("NO"));
+      oled.print(F("SER:"));
+      oled.print(sc);
+      oled.print(F(" ETH:"));
+      oled.println(ec);
+      oled.print(F("SRC: "));
+      oled.println(src);
       oled.display();
       xSemaphoreGive(i2cMutex);
     }
+
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
