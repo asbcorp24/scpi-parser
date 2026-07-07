@@ -12,6 +12,7 @@
 #define MAX_SCPI_PARAMS 32
 #define OLED_CONSOLE_LINES 7
 #define OLED_CONSOLE_COLS 22
+#define MENU_ITEMS 8
 
 class EthernetServerCompat : public EthernetServer {
 public:
@@ -23,11 +24,11 @@ struct LineReceiver { char *buf = nullptr; size_t cap = 0; size_t len = 0; bool 
 struct ParamList { char *v[MAX_SCPI_PARAMS]; int count = 0; };
 struct McpPinRef { int globalPin = -1; int chip = -1; int localPin = -1; };
 
-enum UiMode { UI_CONSOLE, UI_MENU, UI_EDIT_IP, UI_EDIT_GW, UI_EDIT_MASK, UI_EDIT_DNS, UI_EDIT_DHCP };
+enum UiMode { UI_CONSOLE, UI_MENU, UI_EDIT_IP, UI_EDIT_GW, UI_EDIT_MASK, UI_EDIT_DNS, UI_EDIT_DHCP, UI_EDIT_PORT };
 
 Adafruit_MCP23X17 mcp[MCP23017_COUNT];
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
-EthernetServerCompat scpiServer(SCPI_TCP_PORT);
+EthernetServerCompat *scpiServer = nullptr;
 EthernetClient ethClients[MAX_ETH_CLIENTS];
 Preferences prefs;
 
@@ -49,6 +50,7 @@ IPAddress cfgGw(DEFAULT_GW_A, DEFAULT_GW_B, DEFAULT_GW_C, DEFAULT_GW_D);
 IPAddress cfgMask(DEFAULT_MASK_A, DEFAULT_MASK_B, DEFAULT_MASK_C, DEFAULT_MASK_D);
 IPAddress cfgDns(DEFAULT_DNS_A, DEFAULT_DNS_B, DEFAULT_DNS_C, DEFAULT_DNS_D);
 bool cfgUseDhcp = DEFAULT_USE_DHCP;
+uint16_t cfgPort = SCPI_TCP_PORT;
 
 char lastError[96] = "0,\"No error\"";
 char lastSource[8] = "boot";
@@ -207,6 +209,8 @@ static void printParseResult(const ParamList &pl, Stream &io) {
 static void loadNetPrefs() {
   prefs.begin("net", true);
   cfgUseDhcp = prefs.getBool("dhcp", DEFAULT_USE_DHCP);
+  cfgPort = prefs.getUShort("port", SCPI_TCP_PORT);
+  if (cfgPort == 0) cfgPort = SCPI_TCP_PORT;
   cfgIp = IPAddress(prefs.getUChar("ip0", DEFAULT_IP_A), prefs.getUChar("ip1", DEFAULT_IP_B), prefs.getUChar("ip2", DEFAULT_IP_C), prefs.getUChar("ip3", DEFAULT_IP_D));
   cfgGw = IPAddress(prefs.getUChar("gw0", DEFAULT_GW_A), prefs.getUChar("gw1", DEFAULT_GW_B), prefs.getUChar("gw2", DEFAULT_GW_C), prefs.getUChar("gw3", DEFAULT_GW_D));
   cfgMask = IPAddress(prefs.getUChar("ms0", DEFAULT_MASK_A), prefs.getUChar("ms1", DEFAULT_MASK_B), prefs.getUChar("ms2", DEFAULT_MASK_C), prefs.getUChar("ms3", DEFAULT_MASK_D));
@@ -217,6 +221,7 @@ static void loadNetPrefs() {
 static void saveNetPrefs() {
   prefs.begin("net", false);
   prefs.putBool("dhcp", cfgUseDhcp);
+  prefs.putUShort("port", cfgPort);
   for (int i = 0; i < 4; i++) {
     char k[4];
     snprintf(k, sizeof(k), "ip%d", i); prefs.putUChar(k, cfgIp[i]);
@@ -309,6 +314,7 @@ static void cmdNetStat(Stream &io) {
   char ip[18], gw[18], mask[18], dns[18], local[18];
   ipToText(cfgIp, ip, sizeof(ip)); ipToText(cfgGw, gw, sizeof(gw)); ipToText(cfgMask, mask, sizeof(mask)); ipToText(cfgDns, dns, sizeof(dns)); ipToText(currentIp, local, sizeof(local));
   io.print(F("DHCP=")); io.print(cfgUseDhcp ? F("1") : F("0"));
+  io.print(F(",PORT=")); io.print(cfgPort);
   io.print(F(",IP=")); io.print(ip);
   io.print(F(",GW=")); io.print(gw);
   io.print(F(",MASK=")); io.print(mask);
@@ -319,7 +325,7 @@ static void cmdNetStat(Stream &io) {
 static void cmdHelp(Stream &io) {
   io.println(F("*IDN?")); io.println(F("*RST")); io.println(F("HELP?")); io.println(F("MEM?")); io.println(F("PARSE? p0,p1,p2"));
   io.println(F("SYST:ERR?")); io.println(F("SYST:STAT?")); io.println(F("ETH:IP?"));
-  io.println(F("NET:STAT?")); io.println(F("NET:DHCP 0|1")); io.println(F("NET:IP a,b,c,d")); io.println(F("NET:GW a,b,c,d")); io.println(F("NET:MASK a,b,c,d")); io.println(F("NET:DNS a,b,c,d")); io.println(F("NET:SAVE")); io.println(F("NET:RESTART"));
+  io.println(F("NET:STAT?")); io.println(F("NET:DHCP 0|1")); io.println(F("NET:PORT 1..65535")); io.println(F("NET:IP a,b,c,d")); io.println(F("NET:GW a,b,c,d")); io.println(F("NET:MASK a,b,c,d")); io.println(F("NET:DNS a,b,c,d")); io.println(F("NET:SAVE")); io.println(F("NET:RESTART"));
   io.println(F("MCP:STAT?"));
   io.println(F("GPIO:MODE pin,OUT|IN|INPULLUP|INPULLDOWN")); io.println(F("GPIO:WRITE pin,0|1|ON|OFF|HIGH|LOW")); io.println(F("GPIO:READ? pin")); io.println(F("GPIO:TOGGLE pin"));
   io.println(F("MCP pins are global 0..63 for 4x MCP23017")); io.println(F("MCP0 0..15, MCP1 16..31, MCP2 32..47, MCP3 48..63"));
@@ -330,7 +336,7 @@ static void cmdStat(Stream &io) {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   bool er = ethReady, orr = oledReady; IPAddress ip = currentIp; uint32_t sc = serialCount, ec = ethCount, ov = overflowCount; char src[8]; safeCopy(src, sizeof(src), lastSource);
   xSemaphoreGive(stateMutex);
-  io.print(F("ETH=")); io.print(er ? F("1") : F("0")); io.print(F(",IP=")); io.print(ip);
+  io.print(F("ETH=")); io.print(er ? F("1") : F("0")); io.print(F(",IP=")); io.print(ip); io.print(F(",PORT=")); io.print(cfgPort);
   io.print(F(",MCP_READY=")); io.print(mcpReadyCount()); io.print('/'); io.print(MCP23017_COUNT); io.print(F(",MCP_MASK=0x")); io.print(mcpReadyMask(), HEX);
   io.print(F(",OLED=")); io.print(orr ? F("1") : F("0")); io.print(F(",SERIAL_CMDS=")); io.print(sc); io.print(F(",ETH_CMDS=")); io.print(ec); io.print(F(",OVERFLOW=")); io.print(ov); io.print(F(",LAST=")); io.println(src);
 }
@@ -424,6 +430,17 @@ static void handleNetDhcp(char *params, Stream &io) {
   cfgUseDhcp = v ? true : false; saveNetPrefs(); netRestartRequest = true; oledConsolePush("<", cfgUseDhcp ? "DHCP ON" : "DHCP OFF"); io.println(F("OK"));
 }
 
+static void handleNetPort(char *params, Stream &io) {
+  ParamList pl; parseParams(params, pl); int p;
+  if (pl.count < 1 || !parseIntStrict(paramAt(pl, 0), p) || p < 1 || p > 65535) { replyErr(io, "NET:PORT needs 1..65535"); return; }
+  cfgPort = (uint16_t)p;
+  saveNetPrefs();
+  netRestartRequest = true;
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "PORT %u", cfgPort);
+  oledConsolePush("<", res);
+  io.println(F("OK"));
+}
+
 static void handleParseTest(char *params, Stream &io) {
   ParamList pl; parseParams(params, pl); char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "PARAMS=%d", pl.count); oledConsolePush("<", res); printParseResult(pl, io);
 }
@@ -446,6 +463,7 @@ static void handleOneCommand(char *cmdLine, Stream &io) {
   else if (!strcmp(line, "MCP:STAT?")) { cmdMcpStat(io); oledConsolePush("<", "MCP STAT OK"); }
   else if (!strcmp(line, "NET:STAT?")) { cmdNetStat(io); oledConsolePush("<", "NET STAT OK"); }
   else if (!strcmp(line, "NET:DHCP")) handleNetDhcp(params, io);
+  else if (!strcmp(line, "NET:PORT")) handleNetPort(params, io);
   else if (!strcmp(line, "NET:IP")) handleNetIpSet(params, io, cfgIp, "IP");
   else if (!strcmp(line, "NET:GW")) handleNetIpSet(params, io, cfgGw, "GW");
   else if (!strcmp(line, "NET:MASK")) handleNetIpSet(params, io, cfgMask, "MASK");
@@ -486,6 +504,7 @@ static void initI2c() {
 
 static void initW5500() {
   for (int i = 0; i < MAX_ETH_CLIENTS; i++) if (ethClients[i]) ethClients[i].stop();
+  if (scpiServer) { delete scpiServer; scpiServer = nullptr; }
   pinMode(W5500_RST_PIN, OUTPUT);
   digitalWrite(W5500_RST_PIN, LOW); delay(50); digitalWrite(W5500_RST_PIN, HIGH); delay(200);
   SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN, W5500_CS_PIN);
@@ -493,12 +512,13 @@ static void initW5500() {
   int dhcp = 0;
   if (cfgUseDhcp) dhcp = Ethernet.begin(macAddress, 5000, 1000);
   if (!cfgUseDhcp || dhcp == 0) Ethernet.begin(macAddress, cfgIp, cfgDns, cfgGw, cfgMask);
-  scpiServer.begin();
+  scpiServer = new EthernetServerCompat(cfgPort);
+  scpiServer->begin();
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   currentIp = Ethernet.localIP();
   ethReady = Ethernet.hardwareStatus() != EthernetNoHardware && Ethernet.linkStatus() != LinkOFF;
   xSemaphoreGive(stateMutex);
-  char txt[OLED_CONSOLE_COLS]; char ip[18]; ipToText(currentIp, ip, sizeof(ip)); snprintf(txt, sizeof(txt), "NET %s", ip); oledConsolePush("<", txt);
+  char txt[OLED_CONSOLE_COLS]; char ip[18]; ipToText(currentIp, ip, sizeof(ip)); snprintf(txt, sizeof(txt), "NET %s:%u", ip, cfgPort); oledConsolePush("<", txt);
 }
 
 static IPAddress *editIpPtr() {
@@ -521,10 +541,15 @@ static void editOctetDelta(int delta) {
 static void handleEncoderTurn(int delta) {
   if (uiMode == UI_MENU) {
     menuIndex += delta;
-    if (menuIndex < 0) menuIndex = 6;
-    if (menuIndex > 6) menuIndex = 0;
+    if (menuIndex < 0) menuIndex = MENU_ITEMS - 1;
+    if (menuIndex >= MENU_ITEMS) menuIndex = 0;
   } else if (uiMode == UI_EDIT_DHCP) {
     cfgUseDhcp = !cfgUseDhcp;
+  } else if (uiMode == UI_EDIT_PORT) {
+    int p = (int)cfgPort + delta;
+    if (p < 1) p = 65535;
+    if (p > 65535) p = 1;
+    cfgPort = (uint16_t)p;
   } else if (uiMode != UI_CONSOLE) {
     editOctetDelta(delta);
   }
@@ -539,21 +564,22 @@ static void handleEncoderButton() {
     else if (menuIndex == 2) uiMode = UI_EDIT_MASK;
     else if (menuIndex == 3) uiMode = UI_EDIT_DNS;
     else if (menuIndex == 4) uiMode = UI_EDIT_DHCP;
-    else if (menuIndex == 5) { saveNetPrefs(); netRestartRequest = true; uiMode = UI_CONSOLE; oledConsolePush("<", "SAVE+NET RESTART"); }
+    else if (menuIndex == 5) uiMode = UI_EDIT_PORT;
+    else if (menuIndex == 6) { saveNetPrefs(); netRestartRequest = true; uiMode = UI_CONSOLE; oledConsolePush("<", "SAVE+NET RESTART"); }
     else uiMode = UI_CONSOLE;
     return;
   }
-  if (uiMode == UI_EDIT_DHCP) { saveNetPrefs(); netRestartRequest = true; uiMode = UI_MENU; return; }
+  if (uiMode == UI_EDIT_DHCP || uiMode == UI_EDIT_PORT) { saveNetPrefs(); netRestartRequest = true; uiMode = UI_MENU; return; }
   editOctet++;
   if (editOctet > 3) { saveNetPrefs(); netRestartRequest = true; uiMode = UI_MENU; editOctet = 0; }
 }
 
 static void drawMenu() {
-  static const char *items[] = { "IP", "Gateway", "Mask", "DNS", "DHCP", "Save+Restart", "Exit" };
+  static const char *items[] = { "IP", "Gateway", "Mask", "DNS", "DHCP", "Port", "Save+Restart", "Exit" };
   oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE); oled.setCursor(0, 0);
   oled.println(F("== NET MENU =="));
-  int first = menuIndex - 2; if (first < 0) first = 0; if (first > 2) first = 2;
-  for (int i = first; i < first + 5 && i < 7; i++) { oled.print(i == menuIndex ? F(">") : F(" ")); oled.println(items[i]); }
+  int first = menuIndex - 2; if (first < 0) first = 0; if (first > MENU_ITEMS - 5) first = MENU_ITEMS - 5;
+  for (int i = first; i < first + 5 && i < MENU_ITEMS; i++) { oled.print(i == menuIndex ? F(">") : F(" ")); oled.println(items[i]); }
   oled.println(F("Press=enter")); oled.display();
 }
 
@@ -569,6 +595,11 @@ static void drawEditDhcp() {
   oled.println(F("DHCP mode")); oled.println(cfgUseDhcp ? F("ON") : F("OFF")); oled.println(F("Turn=toggle")); oled.println(F("Press=save")); oled.display();
 }
 
+static void drawEditPort() {
+  oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE); oled.setCursor(0, 0);
+  oled.println(F("TCP SCPI Port")); oled.println(cfgPort); oled.println(F("Turn=change")); oled.println(F("Press=save")); oled.display();
+}
+
 void taskSerial(void *) {
   while (true) {
     if (readLine(Serial, serialRx, Serial)) { handleScpiLine(serialRx.buf, Serial, false); resetLine(serialRx); }
@@ -577,9 +608,10 @@ void taskSerial(void *) {
 }
 
 static void acceptClient() {
-  EthernetClient c = scpiServer.available(); if (!c) return;
+  if (!scpiServer) return;
+  EthernetClient c = scpiServer->available(); if (!c) return;
   for (int i = 0; i < MAX_ETH_CLIENTS; i++) {
-    if (!ethClients[i] || !ethClients[i].connected()) { if (ethClients[i]) ethClients[i].stop(); ethClients[i] = c; resetLine(ethRx[i]); ethClients[i].println(F("ESP32-S3 SCPI TCP ready")); ethClients[i].println(F("4x MCP23017, encoder IP menu")); ethClients[i].println(F("Send HELP? NET:STAT? MCP:STAT?")); return; }
+    if (!ethClients[i] || !ethClients[i].connected()) { if (ethClients[i]) ethClients[i].stop(); ethClients[i] = c; resetLine(ethRx[i]); ethClients[i].println(F("ESP32-S3 SCPI TCP ready")); ethClients[i].println(F("4x MCP23017, encoder IP/PORT menu")); ethClients[i].println(F("Send HELP? NET:STAT? MCP:STAT?")); return; }
   }
   c.println(F("ERR: too many clients")); c.stop();
 }
@@ -607,13 +639,14 @@ void taskOled(void *) {
       else if (uiMode == UI_EDIT_MASK) drawEditIp("Edit Mask", cfgMask);
       else if (uiMode == UI_EDIT_DNS) drawEditIp("Edit DNS", cfgDns);
       else if (uiMode == UI_EDIT_DHCP) drawEditDhcp();
+      else if (uiMode == UI_EDIT_PORT) drawEditPort();
       else {
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         bool er = ethReady; uint32_t sc = serialCount, ec = ethCount; char lines[OLED_CONSOLE_LINES][OLED_CONSOLE_COLS];
         for (int i = 0; i < OLED_CONSOLE_LINES; i++) safeCopy(lines[i], sizeof(lines[i]), oledConsole[i]);
         xSemaphoreGive(stateMutex);
         oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE); oled.setCursor(0, 0);
-        oled.print(F("E:")); oled.print(er ? F("OK") : F("NO")); oled.print(F(" M:")); oled.print(mcpReadyCount()); oled.print('/'); oled.print(MCP23017_COUNT); oled.print(F(" U:")); oled.print(sc); oled.print(F(" T:")); oled.println(ec);
+        oled.print(F("E:")); oled.print(er ? F("OK") : F("NO")); oled.print(F(" M:")); oled.print(mcpReadyCount()); oled.print('/'); oled.print(MCP23017_COUNT); oled.print(F(" P:")); oled.println(cfgPort);
         for (int i = 0; i < OLED_CONSOLE_LINES; i++) oled.println(lines[i]);
         oled.display();
       }
@@ -654,7 +687,7 @@ void setup() {
   Serial.print(F("SCPI line length: ")); Serial.println(SCPI_LINE_LENGTH);
   Serial.print(F("PSRAM size: ")); Serial.println(ESP.getPsramSize()); Serial.print(F("PSRAM free: ")); Serial.println(ESP.getFreePsram());
   Serial.print(F("RX buffers allocated: ")); Serial.println(ok ? F("OK") : F("FAIL"));
-  Serial.println(F("OLED console + rotary encoder IP menu enabled"));
+  Serial.println(F("OLED console + rotary encoder IP/PORT menu enabled"));
   if (!ok) { setErr("-300,\"RX buffer allocation failed\""); oledConsolePush("<", "RX alloc fail"); }
   initI2c();
   Serial.print(F("MCP ready: ")); Serial.print(mcpReadyCount()); Serial.print('/'); Serial.println(MCP23017_COUNT);
@@ -662,7 +695,8 @@ void setup() {
   for (int i = 0; i < MCP23017_COUNT; i++) { Serial.print(F("MCP")); Serial.print(i); Serial.print(F(" addr 0x")); Serial.print(mcpAddr[i], HEX); Serial.println(mcpReady[i] ? F(" OK") : F(" NO")); }
   initW5500();
   Serial.print(F("Ethernet IP: ")); Serial.println(Ethernet.localIP());
-  Serial.println(F("USB Serial and TCP/5025 enabled")); Serial.println(F("Send HELP? NET:STAT? MCP:STAT?"));
+  Serial.print(F("SCPI TCP port: ")); Serial.println(cfgPort);
+  Serial.println(F("USB Serial and TCP enabled")); Serial.println(F("Send HELP? NET:STAT? MCP:STAT?"));
   xTaskCreatePinnedToCore(taskSerial, "scpi_serial", TASK_STACK_SERIAL, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(taskEthernet, "scpi_eth", TASK_STACK_ETH, nullptr, 2, nullptr, 1);
   xTaskCreatePinnedToCore(taskOled, "oled", TASK_STACK_OLED, nullptr, 1, nullptr, 1);
