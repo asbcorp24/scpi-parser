@@ -26,6 +26,14 @@
 #define OLED_HEIGHT 64
 #define OLED_RESET_PIN -1
 
+// KEYESTUDIO Rotary Encoder Module
+// CLK -> GPIO38, DT -> GPIO39, SW -> GPIO40 by default.
+// Change here if your wiring is different.
+#define ENC_CLK_PIN 38
+#define ENC_DT_PIN 39
+#define ENC_SW_PIN 40
+#define ENC_BUTTON_DEBOUNCE_MS 180
+
 // W5500 SPI pins. Change to your wiring.
 #define W5500_SCK_PIN 12
 #define W5500_MISO_PIN 13
@@ -40,14 +48,33 @@
 // Every client gets its own PSRAM RX line buffer.
 #define MAX_ETH_CLIENTS 1
 
-// Network fallback if DHCP fails
+// Network default/fallback settings. Can be changed from OLED encoder menu or SCPI.
+#define DEFAULT_USE_DHCP 1
+#define DEFAULT_IP_A 192
+#define DEFAULT_IP_B 168
+#define DEFAULT_IP_C 1
+#define DEFAULT_IP_D 77
+#define DEFAULT_GW_A 192
+#define DEFAULT_GW_B 168
+#define DEFAULT_GW_C 1
+#define DEFAULT_GW_D 1
+#define DEFAULT_MASK_A 255
+#define DEFAULT_MASK_B 255
+#define DEFAULT_MASK_C 255
+#define DEFAULT_MASK_D 0
+#define DEFAULT_DNS_A 192
+#define DEFAULT_DNS_B 168
+#define DEFAULT_DNS_C 1
+#define DEFAULT_DNS_D 1
+
+// If DHCP fails and DEFAULT_USE_DHCP=1, use static fallback from saved/default IP.
 #define USE_STATIC_IP_IF_DHCP_FAIL 1
 
 // Device identity
 #define DEVICE_MANUFACTURER "ASBCORP"
 #define DEVICE_MODEL "ESP32S3-SCPI-ASYNC-GPIO"
 #define DEVICE_SERIAL "N8R2"
-#define DEVICE_VERSION "0.4-4mcp-console"
+#define DEVICE_VERSION "0.5-encoder-ip-menu"
 
 // Long SCPI command line length.
 // Allocated from PSRAM with heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT).
@@ -58,3 +85,4 @@
 #define TASK_STACK_SERIAL 3072
 #define TASK_STACK_ETH 6144
 #define TASK_STACK_OLED 3072
+#define TASK_STACK_ENCODER 3072
