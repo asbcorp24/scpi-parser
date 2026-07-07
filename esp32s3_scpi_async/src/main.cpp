@@ -33,7 +33,13 @@ struct ParamList {
   int count;
 };
 
-Adafruit_MCP23X17 mcp;
+struct McpPinRef {
+  int globalPin = -1;
+  int chip = -1;
+  int localPin = -1;
+};
+
+Adafruit_MCP23X17 mcp[MCP23017_COUNT];
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
 EthernetServerCompat scpiServer(SCPI_TCP_PORT);
 EthernetClient ethClients[MAX_ETH_CLIENTS];
@@ -44,7 +50,14 @@ LineReceiver ethRx[MAX_ETH_CLIENTS];
 SemaphoreHandle_t i2cMutex;
 SemaphoreHandle_t stateMutex;
 
-bool mcpReady = false;
+const uint8_t mcpAddr[MCP23017_COUNT] = {
+  MCP23017_ADDR0,
+  MCP23017_ADDR1,
+  MCP23017_ADDR2,
+  MCP23017_ADDR3
+};
+
+bool mcpReady[MCP23017_COUNT] = {false, false, false, false};
 bool oledReady = false;
 bool ethReady = false;
 bool psramReady = false;
@@ -69,11 +82,21 @@ static void safeCopy(char *dst, size_t dstSize, const char *src) {
   dst[dstSize - 1] = 0;
 }
 
+static int mcpReadyCount() {
+  int c = 0;
+  for (int i = 0; i < MCP23017_COUNT; i++) if (mcpReady[i]) c++;
+  return c;
+}
+
+static uint8_t mcpReadyMask() {
+  uint8_t mask = 0;
+  for (int i = 0; i < MCP23017_COUNT; i++) if (mcpReady[i]) mask |= (1 << i);
+  return mask;
+}
+
 static void oledConsoleClear() {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  for (int i = 0; i < OLED_CONSOLE_LINES; i++) {
-    oledConsole[i][0] = 0;
-  }
+  for (int i = 0; i < OLED_CONSOLE_LINES; i++) oledConsole[i][0] = 0;
   xSemaphoreGive(stateMutex);
 }
 
@@ -171,17 +194,6 @@ static bool parseDigital(const char *s, int &out) {
   return false;
 }
 
-static bool parseFloatStrict(const char *s, float &out) {
-  if (!s) return false;
-  while (*s && isspace((unsigned char)*s)) s++;
-  char *endPtr = nullptr;
-  float v = strtof(s, &endPtr);
-  while (endPtr && isspace((unsigned char)*endPtr)) endPtr++;
-  if (!endPtr || *endPtr != 0) return false;
-  out = v;
-  return true;
-}
-
 static bool isDelimiter(char c) {
   return c == ',' || isspace((unsigned char)c);
 }
@@ -194,44 +206,27 @@ static void initParams(ParamList &pl) {
 static int parseParams(char *params, ParamList &pl) {
   initParams(pl);
   if (!params) return 0;
-
   char *p = params;
   while (*p && pl.count < MAX_SCPI_PARAMS) {
     while (*p && isDelimiter(*p)) p++;
     if (!*p) break;
-
     char *start = nullptr;
-
     if (*p == '"' || *p == '\'') {
-      char quote = *p;
-      p++;
+      char quote = *p++;
       start = p;
       while (*p && *p != quote) p++;
-      if (*p == quote) {
-        *p = 0;
-        p++;
-      }
+      if (*p == quote) *p++ = 0;
       while (*p && !isDelimiter(*p)) p++;
-      if (*p) {
-        *p = 0;
-        p++;
-      }
+      if (*p) *p++ = 0;
     } else {
       start = p;
       while (*p && !isDelimiter(*p)) p++;
-      if (*p) {
-        *p = 0;
-        p++;
-      }
+      if (*p) *p++ = 0;
     }
-
     start = trim(start);
     stripLiteralEscapesAtEnd(start);
-    if (*start) {
-      pl.v[pl.count++] = start;
-    }
+    if (*start) pl.v[pl.count++] = start;
   }
-
   return pl.count;
 }
 
@@ -244,9 +239,7 @@ static void printParseResult(const ParamList &pl, Stream &io) {
   io.print(F("PARAMS="));
   io.print(pl.count);
   for (int i = 0; i < pl.count; i++) {
-    io.print(F(",P"));
-    io.print(i);
-    io.print(F("=\""));
+    io.print(F(",P")); io.print(i); io.print(F("=\""));
     io.print(pl.v[i] ? pl.v[i] : "");
     io.print(F("\""));
   }
@@ -272,18 +265,21 @@ static bool parseEspPin(const char *s, int &pin) {
   return true;
 }
 
-static bool parseMcpPin(const char *s, int &pin) {
+static bool parseMcpPinRef(const char *s, McpPinRef &ref) {
   int p = -1;
   if (!parseIntStrict(s, p)) return false;
-  if (p < 0 || p > 15) return false;
-  pin = p;
+  if (p < 0 || p >= MCP_TOTAL_PINS) return false;
+  ref.globalPin = p;
+  ref.chip = p / 16;
+  ref.localPin = p % 16;
+  if (ref.chip < 0 || ref.chip >= MCP23017_COUNT) return false;
+  if (!mcpReady[ref.chip]) return false;
   return true;
 }
 
 static void incCounter(bool eth, const char *src) {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  if (eth) ethCount++;
-  else serialCount++;
+  if (eth) ethCount++; else serialCount++;
   safeCopy(lastSource, sizeof(lastSource), src);
   xSemaphoreGive(stateMutex);
 }
@@ -292,11 +288,8 @@ static bool allocLineReceiver(LineReceiver &rx) {
   rx.cap = SCPI_LINE_LENGTH;
   rx.len = 0;
   rx.overflow = false;
-
   rx.buf = (char *)heap_caps_malloc(rx.cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!rx.buf) {
-    rx.buf = (char *)heap_caps_malloc(rx.cap, MALLOC_CAP_8BIT);
-  }
+  if (!rx.buf) rx.buf = (char *)heap_caps_malloc(rx.cap, MALLOC_CAP_8BIT);
   if (!rx.buf) return false;
   rx.buf[0] = 0;
   return true;
@@ -312,9 +305,7 @@ static bool readLine(Stream &io, LineReceiver &rx, Stream &replyTo) {
   while (io.available()) {
     int c = io.read();
     if (c < 0) break;
-
     if (c == '\r') continue;
-
     if (c == '\n') {
       if (rx.overflow) {
         resetLine(rx);
@@ -328,36 +319,37 @@ static bool readLine(Stream &io, LineReceiver &rx, Stream &replyTo) {
       rx.buf[rx.len] = 0;
       return rx.len > 0;
     }
-
     if (!rx.buf || rx.cap < 2) continue;
-
     if (rx.len + 1 >= rx.cap) {
       rx.overflow = true;
       continue;
     }
-
     rx.buf[rx.len++] = (char)c;
   }
   return false;
 }
 
 static void cmdMem(Stream &io) {
-  io.print(F("HEAP_FREE="));
-  io.print(ESP.getFreeHeap());
-  io.print(F(",HEAP_MIN="));
-  io.print(ESP.getMinFreeHeap());
-  io.print(F(",HEAP_LARGEST="));
-  io.print(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  io.print(F(",PSRAM_SIZE="));
-  io.print(ESP.getPsramSize());
-  io.print(F(",PSRAM_FREE="));
-  io.print(ESP.getFreePsram());
-  io.print(F(",PSRAM_LARGEST="));
-  io.print(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-  io.print(F(",SCPI_LINE="));
-  io.print(SCPI_LINE_LENGTH);
-  io.print(F(",PSRAM_RX="));
-  io.println(psramReady ? F("1") : F("0"));
+  io.print(F("HEAP_FREE=")); io.print(ESP.getFreeHeap());
+  io.print(F(",HEAP_MIN=")); io.print(ESP.getMinFreeHeap());
+  io.print(F(",HEAP_LARGEST=")); io.print(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  io.print(F(",PSRAM_SIZE=")); io.print(ESP.getPsramSize());
+  io.print(F(",PSRAM_FREE=")); io.print(ESP.getFreePsram());
+  io.print(F(",PSRAM_LARGEST=")); io.print(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+  io.print(F(",SCPI_LINE=")); io.print(SCPI_LINE_LENGTH);
+  io.print(F(",PSRAM_RX=")); io.println(psramReady ? F("1") : F("0"));
+}
+
+static void cmdMcpStat(Stream &io) {
+  io.print(F("MCP_COUNT=")); io.print(MCP23017_COUNT);
+  io.print(F(",MCP_READY=")); io.print(mcpReadyCount());
+  io.print(F(",MCP_MASK=0x")); io.print(mcpReadyMask(), HEX);
+  for (int i = 0; i < MCP23017_COUNT; i++) {
+    io.print(F(",MCP")); io.print(i);
+    io.print(F("=0x")); io.print(mcpAddr[i], HEX);
+    io.print(mcpReady[i] ? F("/OK") : F("/NO"));
+  }
+  io.println();
 }
 
 static void cmdHelp(Stream &io) {
@@ -369,34 +361,31 @@ static void cmdHelp(Stream &io) {
   io.println(F("SYST:ERR?"));
   io.println(F("SYST:STAT?"));
   io.println(F("ETH:IP?"));
+  io.println(F("MCP:STAT?"));
   io.println(F("GPIO:MODE pin,OUT|IN|INPULLUP|INPULLDOWN"));
   io.println(F("GPIO:WRITE pin,0|1|ON|OFF|HIGH|LOW"));
   io.println(F("GPIO:READ? pin"));
   io.println(F("GPIO:TOGGLE pin"));
-  io.println(F("MCP:MODE 0..15,OUT|IN|INPULLUP"));
-  io.println(F("MCP:WRITE 0..15,0|1|ON|OFF|HIGH|LOW"));
-  io.println(F("MCP:READ? 0..15"));
-  io.println(F("MCP:TOGGLE 0..15"));
-  io.println(F("Accepted params: comma or spaces, any case, extra spaces, quoted text"));
-  io.println(F("Example: gpio:write  5 , on ; mcp:write 0 off ; mem?"));
+  io.println(F("MCP pins are global 0..63 for 4x MCP23017"));
+  io.println(F("MCP0 0..15, MCP1 16..31, MCP2 32..47, MCP3 48..63"));
+  io.println(F("MCP:MODE 0..63,OUT|IN|INPULLUP"));
+  io.println(F("MCP:WRITE 0..63,0|1|ON|OFF|HIGH|LOW"));
+  io.println(F("MCP:READ? 0..63"));
+  io.println(F("MCP:TOGGLE 0..63"));
 }
 
 static void cmdStat(Stream &io) {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   bool er = ethReady;
-  bool mr = mcpReady;
   bool orr = oledReady;
   IPAddress ip = currentIp;
-  uint32_t sc = serialCount;
-  uint32_t ec = ethCount;
-  uint32_t ov = overflowCount;
-  char src[8];
-  safeCopy(src, sizeof(src), lastSource);
+  uint32_t sc = serialCount, ec = ethCount, ov = overflowCount;
+  char src[8]; safeCopy(src, sizeof(src), lastSource);
   xSemaphoreGive(stateMutex);
-
   io.print(F("ETH=")); io.print(er ? F("1") : F("0"));
   io.print(F(",IP=")); io.print(ip);
-  io.print(F(",MCP=")); io.print(mr ? F("1") : F("0"));
+  io.print(F(",MCP_READY=")); io.print(mcpReadyCount()); io.print('/'); io.print(MCP23017_COUNT);
+  io.print(F(",MCP_MASK=0x")); io.print(mcpReadyMask(), HEX);
   io.print(F(",OLED=")); io.print(orr ? F("1") : F("0"));
   io.print(F(",SERIAL_CMDS=")); io.print(sc);
   io.print(F(",ETH_CMDS=")); io.print(ec);
@@ -405,16 +394,11 @@ static void cmdStat(Stream &io) {
 }
 
 static void handleGpioMode(char *params, Stream &io) {
-  ParamList pl;
-  parseParams(params, pl);
+  ParamList pl; parseParams(params, pl);
   int pin;
   if (pl.count < 2) { replyErr(io, "GPIO:MODE needs pin,mode"); return; }
   if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
-
-  char mode[24];
-  safeCopy(mode, sizeof(mode), paramAt(pl, 1));
-  upperAscii(mode);
-
+  char mode[24]; safeCopy(mode, sizeof(mode), paramAt(pl, 1)); upperAscii(mode);
   if (!strcmp(mode, "OUT") || !strcmp(mode, "OUTPUT")) pinMode(pin, OUTPUT);
   else if (!strcmp(mode, "IN") || !strcmp(mode, "INPUT")) pinMode(pin, INPUT);
   else if (!strcmp(mode, "INPULLUP") || !strcmp(mode, "INPUT_PULLUP") || !strcmp(mode, "PULLUP")) pinMode(pin, INPUT_PULLUP);
@@ -425,150 +409,117 @@ static void handleGpioMode(char *params, Stream &io) {
 }
 
 static void handleGpioWrite(char *params, Stream &io) {
-  ParamList pl;
-  parseParams(params, pl);
+  ParamList pl; parseParams(params, pl);
   int pin, value;
   if (pl.count < 2) { replyErr(io, "GPIO:WRITE needs pin,value"); return; }
   if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
   if (!parseDigital(paramAt(pl, 1), value)) { replyErr(io, "bad GPIO value"); return; }
   pinMode(pin, OUTPUT);
   digitalWrite(pin, value);
-  char res[OLED_CONSOLE_COLS];
-  snprintf(res, sizeof(res), "OK GPIO%d=%d", pin, value ? 1 : 0);
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "OK GPIO%d=%d", pin, value ? 1 : 0);
   oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
 static void handleGpioRead(char *params, Stream &io) {
-  ParamList pl;
-  parseParams(params, pl);
+  ParamList pl; parseParams(params, pl);
   int pin;
   if (pl.count < 1) { replyErr(io, "GPIO:READ? needs pin"); return; }
   if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
   int v = digitalRead(pin) ? 1 : 0;
-  char res[OLED_CONSOLE_COLS];
-  snprintf(res, sizeof(res), "GPIO%d=%d", pin, v);
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "GPIO%d=%d", pin, v);
   oledConsolePush("<", res);
   io.println(v ? F("1") : F("0"));
 }
 
 static void handleGpioToggle(char *params, Stream &io) {
-  ParamList pl;
-  parseParams(params, pl);
+  ParamList pl; parseParams(params, pl);
   int pin;
   if (pl.count < 1) { replyErr(io, "GPIO:TOGGLE needs pin"); return; }
   if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
   pinMode(pin, OUTPUT);
   digitalWrite(pin, !digitalRead(pin));
   int v = digitalRead(pin) ? 1 : 0;
-  char res[OLED_CONSOLE_COLS];
-  snprintf(res, sizeof(res), "OK GPIO%d=%d", pin, v);
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "OK GPIO%d=%d", pin, v);
   oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
 static void handleMcpMode(char *params, Stream &io) {
-  if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  ParamList pl;
-  parseParams(params, pl);
-  int pin;
+  ParamList pl; parseParams(params, pl);
+  McpPinRef r;
   if (pl.count < 2) { replyErr(io, "MCP:MODE needs pin,mode"); return; }
-  if (!parseMcpPin(paramAt(pl, 0), pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
-
-  char mode[24];
-  safeCopy(mode, sizeof(mode), paramAt(pl, 1));
-  upperAscii(mode);
-
+  if (!parseMcpPinRef(paramAt(pl, 0), r)) { replyErr(io, "bad/offline MCP pin 0..63"); return; }
+  char mode[24]; safeCopy(mode, sizeof(mode), paramAt(pl, 1)); upperAscii(mode);
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  if (!strcmp(mode, "OUT") || !strcmp(mode, "OUTPUT")) mcp.pinMode(pin, OUTPUT);
-  else if (!strcmp(mode, "IN") || !strcmp(mode, "INPUT")) mcp.pinMode(pin, INPUT);
-  else if (!strcmp(mode, "INPULLUP") || !strcmp(mode, "INPUT_PULLUP") || !strcmp(mode, "PULLUP")) mcp.pinMode(pin, INPUT_PULLUP);
-  else {
-    xSemaphoreGive(i2cMutex);
-    replyErr(io, "unknown MCP mode");
-    return;
-  }
+  if (!strcmp(mode, "OUT") || !strcmp(mode, "OUTPUT")) mcp[r.chip].pinMode(r.localPin, OUTPUT);
+  else if (!strcmp(mode, "IN") || !strcmp(mode, "INPUT")) mcp[r.chip].pinMode(r.localPin, INPUT);
+  else if (!strcmp(mode, "INPULLUP") || !strcmp(mode, "INPUT_PULLUP") || !strcmp(mode, "PULLUP")) mcp[r.chip].pinMode(r.localPin, INPUT_PULLUP);
+  else { xSemaphoreGive(i2cMutex); replyErr(io, "unknown MCP mode"); return; }
   xSemaphoreGive(i2cMutex);
-  char res[OLED_CONSOLE_COLS];
-  snprintf(res, sizeof(res), "OK MCP%d MODE", pin);
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "OK M%d.%d MODE", r.chip, r.localPin);
   oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
 static void handleMcpWrite(char *params, Stream &io) {
-  if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  ParamList pl;
-  parseParams(params, pl);
-  int pin, value;
+  ParamList pl; parseParams(params, pl);
+  McpPinRef r;
+  int value;
   if (pl.count < 2) { replyErr(io, "MCP:WRITE needs pin,value"); return; }
-  if (!parseMcpPin(paramAt(pl, 0), pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
+  if (!parseMcpPinRef(paramAt(pl, 0), r)) { replyErr(io, "bad/offline MCP pin 0..63"); return; }
   if (!parseDigital(paramAt(pl, 1), value)) { replyErr(io, "bad MCP value"); return; }
-
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  mcp.pinMode(pin, OUTPUT);
-  mcp.digitalWrite(pin, value);
+  mcp[r.chip].pinMode(r.localPin, OUTPUT);
+  mcp[r.chip].digitalWrite(r.localPin, value);
   xSemaphoreGive(i2cMutex);
-  char res[OLED_CONSOLE_COLS];
-  snprintf(res, sizeof(res), "OK MCP%d=%d", pin, value ? 1 : 0);
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "OK M%d.%d=%d", r.chip, r.localPin, value ? 1 : 0);
   oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
 static void handleMcpRead(char *params, Stream &io) {
-  if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  ParamList pl;
-  parseParams(params, pl);
-  int pin;
+  ParamList pl; parseParams(params, pl);
+  McpPinRef r;
   if (pl.count < 1) { replyErr(io, "MCP:READ? needs pin"); return; }
-  if (!parseMcpPin(paramAt(pl, 0), pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
-
+  if (!parseMcpPinRef(paramAt(pl, 0), r)) { replyErr(io, "bad/offline MCP pin 0..63"); return; }
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  int v = mcp.digitalRead(pin) ? 1 : 0;
+  int v = mcp[r.chip].digitalRead(r.localPin) ? 1 : 0;
   xSemaphoreGive(i2cMutex);
-  char res[OLED_CONSOLE_COLS];
-  snprintf(res, sizeof(res), "MCP%d=%d", pin, v);
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "M%d.%d=%d", r.chip, r.localPin, v);
   oledConsolePush("<", res);
   io.println(v ? F("1") : F("0"));
 }
 
 static void handleMcpToggle(char *params, Stream &io) {
-  if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  ParamList pl;
-  parseParams(params, pl);
-  int pin;
+  ParamList pl; parseParams(params, pl);
+  McpPinRef r;
   if (pl.count < 1) { replyErr(io, "MCP:TOGGLE needs pin"); return; }
-  if (!parseMcpPin(paramAt(pl, 0), pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
-
+  if (!parseMcpPinRef(paramAt(pl, 0), r)) { replyErr(io, "bad/offline MCP pin 0..63"); return; }
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  mcp.pinMode(pin, OUTPUT);
-  int v = mcp.digitalRead(pin);
-  mcp.digitalWrite(pin, !v);
-  int nv = mcp.digitalRead(pin) ? 1 : 0;
+  mcp[r.chip].pinMode(r.localPin, OUTPUT);
+  int v = mcp[r.chip].digitalRead(r.localPin);
+  mcp[r.chip].digitalWrite(r.localPin, !v);
+  int nv = mcp[r.chip].digitalRead(r.localPin) ? 1 : 0;
   xSemaphoreGive(i2cMutex);
-  char res[OLED_CONSOLE_COLS];
-  snprintf(res, sizeof(res), "OK MCP%d=%d", pin, nv);
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "OK M%d.%d=%d", r.chip, r.localPin, nv);
   oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
 static void handleParseTest(char *params, Stream &io) {
-  ParamList pl;
-  parseParams(params, pl);
-  char res[OLED_CONSOLE_COLS];
-  snprintf(res, sizeof(res), "PARAMS=%d", pl.count);
+  ParamList pl; parseParams(params, pl);
+  char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "PARAMS=%d", pl.count);
   oledConsolePush("<", res);
   printParseResult(pl, io);
 }
 
 static void handleOneCommand(char *cmdLine, Stream &io) {
-  char original[OLED_CONSOLE_COLS];
-  safeCopy(original, sizeof(original), trim(cmdLine));
+  char original[OLED_CONSOLE_COLS]; safeCopy(original, sizeof(original), trim(cmdLine));
   oledConsolePush(">", original);
-
   char *line = trim(cmdLine);
   stripLiteralEscapesAtEnd(line);
   if (!line || !*line) return;
-
   char *params = line;
   while (*params && !isspace((unsigned char)*params) && *params != '(') params++;
   if (*params) {
@@ -577,76 +528,40 @@ static void handleOneCommand(char *cmdLine, Stream &io) {
     params++;
     params = trim(params);
     if (ender == '(') stripLiteralEscapesAtEnd(params);
-  } else {
-    params = nullptr;
-  }
-
+  } else params = nullptr;
   upperAscii(line);
 
   if (!strcmp(line, "*IDN?")) {
-    io.print(DEVICE_MANUFACTURER); io.print(',');
-    io.print(DEVICE_MODEL); io.print(',');
-    io.print(DEVICE_SERIAL); io.print(',');
-    io.println(DEVICE_VERSION);
+    io.print(DEVICE_MANUFACTURER); io.print(','); io.print(DEVICE_MODEL); io.print(','); io.print(DEVICE_SERIAL); io.print(','); io.println(DEVICE_VERSION);
     oledConsolePush("<", "IDN OK");
   } else if (!strcmp(line, "*RST")) {
-    setErr("0,\"No error\"");
-    oledConsoleClear();
-    oledConsolePush("<", "RESET OK");
-    io.println(F("OK"));
-  } else if (!strcmp(line, "HELP?")) {
-    cmdHelp(io);
-    oledConsolePush("<", "HELP OK");
-  } else if (!strcmp(line, "MEM?")) {
-    cmdMem(io);
-    oledConsolePush("<", "MEM OK");
-  } else if (!strcmp(line, "PARSE?") || !strcmp(line, "SYST:PARSE?")) {
-    handleParseTest(params, io);
+    setErr("0,\"No error\""); oledConsoleClear(); oledConsolePush("<", "RESET OK"); io.println(F("OK"));
+  } else if (!strcmp(line, "HELP?")) { cmdHelp(io); oledConsolePush("<", "HELP OK");
+  } else if (!strcmp(line, "MEM?")) { cmdMem(io); oledConsolePush("<", "MEM OK");
+  } else if (!strcmp(line, "PARSE?") || !strcmp(line, "SYST:PARSE?")) { handleParseTest(params, io);
+  } else if (!strcmp(line, "MCP:STAT?")) { cmdMcpStat(io); oledConsolePush("<", "MCP STAT OK");
   } else if (!strcmp(line, "SYST:ERR?") || !strcmp(line, "SYSTEM:ERROR?")) {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
-    char e[96];
-    safeCopy(e, sizeof(e), lastError);
-    safeCopy(lastError, sizeof(lastError), "0,\"No error\"");
+    char e[96]; safeCopy(e, sizeof(e), lastError); safeCopy(lastError, sizeof(lastError), "0,\"No error\"");
     xSemaphoreGive(stateMutex);
-    io.println(e);
-    oledConsolePush("<", e);
-  } else if (!strcmp(line, "SYST:STAT?") || !strcmp(line, "SYSTEM:STATUS?")) {
-    cmdStat(io);
-    oledConsolePush("<", "STAT OK");
+    io.println(e); oledConsolePush("<", e);
+  } else if (!strcmp(line, "SYST:STAT?") || !strcmp(line, "SYSTEM:STATUS?")) { cmdStat(io); oledConsolePush("<", "STAT OK");
   } else if (!strcmp(line, "ETH:IP?") || !strcmp(line, "ETHERNET:IP?")) {
-    xSemaphoreTake(stateMutex, portMAX_DELAY);
-    IPAddress ip = currentIp;
-    xSemaphoreGive(stateMutex);
-    io.println(ip);
-    char res[OLED_CONSOLE_COLS];
-    snprintf(res, sizeof(res), "IP %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-    oledConsolePush("<", res);
-  } else if (!strcmp(line, "GPIO:MODE")) {
-    handleGpioMode(params, io);
-  } else if (!strcmp(line, "GPIO:WRITE")) {
-    handleGpioWrite(params, io);
-  } else if (!strcmp(line, "GPIO:READ?")) {
-    handleGpioRead(params, io);
-  } else if (!strcmp(line, "GPIO:TOGGLE")) {
-    handleGpioToggle(params, io);
-  } else if (!strcmp(line, "MCP:MODE")) {
-    handleMcpMode(params, io);
-  } else if (!strcmp(line, "MCP:WRITE")) {
-    handleMcpWrite(params, io);
-  } else if (!strcmp(line, "MCP:READ?")) {
-    handleMcpRead(params, io);
-  } else if (!strcmp(line, "MCP:TOGGLE")) {
-    handleMcpToggle(params, io);
-  } else {
-    setErr("-113,\"Undefined header\"");
-    oledConsolePush("<", "-113 Undefined");
-    io.println(F("-113,\"Undefined header\""));
-  }
+    xSemaphoreTake(stateMutex, portMAX_DELAY); IPAddress ip = currentIp; xSemaphoreGive(stateMutex);
+    io.println(ip); char res[OLED_CONSOLE_COLS]; snprintf(res, sizeof(res), "IP %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]); oledConsolePush("<", res);
+  } else if (!strcmp(line, "GPIO:MODE")) handleGpioMode(params, io);
+  else if (!strcmp(line, "GPIO:WRITE")) handleGpioWrite(params, io);
+  else if (!strcmp(line, "GPIO:READ?")) handleGpioRead(params, io);
+  else if (!strcmp(line, "GPIO:TOGGLE")) handleGpioToggle(params, io);
+  else if (!strcmp(line, "MCP:MODE")) handleMcpMode(params, io);
+  else if (!strcmp(line, "MCP:WRITE")) handleMcpWrite(params, io);
+  else if (!strcmp(line, "MCP:READ?")) handleMcpRead(params, io);
+  else if (!strcmp(line, "MCP:TOGGLE")) handleMcpToggle(params, io);
+  else { setErr("-113,\"Undefined header\""); oledConsolePush("<", "-113 Undefined"); io.println(F("-113,\"Undefined header\"")); }
 }
 
 static void handleScpiLine(char *line, Stream &io, bool eth) {
   incCounter(eth, eth ? "ETH" : "USB");
-
   char *part = line;
   while (part && *part) {
     char *sep = strchr(part, ';');
@@ -659,13 +574,13 @@ static void handleScpiLine(char *line, Stream &io, bool eth) {
 
 static void initI2c() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
-
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  mcpReady = mcp.begin_I2C(MCP23017_ADDR, &Wire);
-  if (mcpReady) {
-    for (int i = 0; i < 16; i++) mcp.pinMode(i, INPUT_PULLUP);
+  for (int chip = 0; chip < MCP23017_COUNT; chip++) {
+    mcpReady[chip] = mcp[chip].begin_I2C(mcpAddr[chip], &Wire);
+    if (mcpReady[chip]) {
+      for (int p = 0; p < 16; p++) mcp[chip].pinMode(p, INPUT_PULLUP);
+    }
   }
-
   oledReady = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   if (oledReady) {
     oled.clearDisplay();
@@ -673,7 +588,7 @@ static void initI2c() {
     oled.setTextColor(SSD1306_WHITE);
     oled.setCursor(0, 0);
     oled.println(F("SCPI GPIO boot"));
-    oled.println(F("console mode"));
+    oled.println(F("4x MCP console"));
     oled.display();
   }
   xSemaphoreGive(i2cMutex);
@@ -681,21 +596,15 @@ static void initI2c() {
 
 static void initW5500() {
   pinMode(W5500_RST_PIN, OUTPUT);
-  digitalWrite(W5500_RST_PIN, LOW);
-  delay(50);
-  digitalWrite(W5500_RST_PIN, HIGH);
-  delay(200);
-
+  digitalWrite(W5500_RST_PIN, LOW); delay(50);
+  digitalWrite(W5500_RST_PIN, HIGH); delay(200);
   SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN, W5500_CS_PIN);
   Ethernet.init(W5500_CS_PIN);
-
   int dhcp = Ethernet.begin(macAddress, 5000, 1000);
 #if USE_STATIC_IP_IF_DHCP_FAIL
   if (dhcp == 0) Ethernet.begin(macAddress, fallbackIp, fallbackDns, fallbackGw, fallbackMask);
 #endif
-
   scpiServer.begin();
-
   xSemaphoreTake(stateMutex, portMAX_DELAY);
   currentIp = Ethernet.localIP();
   ethReady = Ethernet.hardwareStatus() != EthernetNoHardware && Ethernet.linkStatus() != LinkOFF;
@@ -715,19 +624,17 @@ void taskSerial(void *) {
 static void acceptClient() {
   EthernetClient c = scpiServer.available();
   if (!c) return;
-
   for (int i = 0; i < MAX_ETH_CLIENTS; i++) {
     if (!ethClients[i] || !ethClients[i].connected()) {
       if (ethClients[i]) ethClients[i].stop();
       ethClients[i] = c;
       resetLine(ethRx[i]);
       ethClients[i].println(F("ESP32-S3 SCPI TCP ready"));
-      ethClients[i].println(F("Long commands use PSRAM buffer"));
-      ethClients[i].println(F("Send HELP? MEM? PARSE?"));
+      ethClients[i].println(F("4x MCP23017, pins 0..63"));
+      ethClients[i].println(F("Send HELP? MEM? MCP:STAT?"));
       return;
     }
   }
-
   c.println(F("ERR: too many clients"));
   c.stop();
 }
@@ -736,7 +643,6 @@ void taskEthernet(void *) {
   while (true) {
     Ethernet.maintain();
     acceptClient();
-
     for (int i = 0; i < MAX_ETH_CLIENTS; i++) {
       if (ethClients[i] && ethClients[i].connected()) {
         if (readLine(ethClients[i], ethRx[i], ethClients[i])) {
@@ -748,12 +654,10 @@ void taskEthernet(void *) {
         resetLine(ethRx[i]);
       }
     }
-
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     currentIp = Ethernet.localIP();
     ethReady = Ethernet.hardwareStatus() != EthernetNoHardware && Ethernet.linkStatus() != LinkOFF;
     xSemaphoreGive(stateMutex);
-
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
@@ -763,27 +667,20 @@ void taskOled(void *) {
     if (oledReady) {
       xSemaphoreTake(stateMutex, portMAX_DELAY);
       bool er = ethReady;
-      bool mr = mcpReady;
-      uint32_t sc = serialCount;
-      uint32_t ec = ethCount;
+      uint32_t sc = serialCount, ec = ethCount;
       char lines[OLED_CONSOLE_LINES][OLED_CONSOLE_COLS];
-      for (int i = 0; i < OLED_CONSOLE_LINES; i++) {
-        safeCopy(lines[i], sizeof(lines[i]), oledConsole[i]);
-      }
+      for (int i = 0; i < OLED_CONSOLE_LINES; i++) safeCopy(lines[i], sizeof(lines[i]), oledConsole[i]);
       xSemaphoreGive(stateMutex);
-
       xSemaphoreTake(i2cMutex, portMAX_DELAY);
       oled.clearDisplay();
       oled.setTextSize(1);
       oled.setTextColor(SSD1306_WHITE);
       oled.setCursor(0, 0);
       oled.print(F("E:")); oled.print(er ? F("OK") : F("NO"));
-      oled.print(F(" M:")); oled.print(mr ? F("OK") : F("NO"));
+      oled.print(F(" M:")); oled.print(mcpReadyCount()); oled.print('/'); oled.print(MCP23017_COUNT);
       oled.print(F(" U:")); oled.print(sc);
       oled.print(F(" T:")); oled.println(ec);
-      for (int i = 0; i < OLED_CONSOLE_LINES; i++) {
-        oled.println(lines[i]);
-      }
+      for (int i = 0; i < OLED_CONSOLE_LINES; i++) oled.println(lines[i]);
       oled.display();
       xSemaphoreGive(i2cMutex);
     }
@@ -794,17 +691,13 @@ void taskOled(void *) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-
   i2cMutex = xSemaphoreCreateMutex();
   stateMutex = xSemaphoreCreateMutex();
   oledConsoleClear();
   oledConsolePushRaw("console ready");
-
   psramReady = psramFound() && ESP.getPsramSize() > 0;
-
   bool ok = allocLineReceiver(serialRx);
   for (int i = 0; i < MAX_ETH_CLIENTS; i++) ok = allocLineReceiver(ethRx[i]) && ok;
-
   Serial.println();
   Serial.println(F("ESP32-S3 long SCPI GPIO ready"));
   Serial.print(F("SCPI line length: ")); Serial.println(SCPI_LINE_LENGTH);
@@ -813,20 +706,18 @@ void setup() {
   Serial.print(F("RX buffers allocated: ")); Serial.println(ok ? F("OK") : F("FAIL"));
   Serial.println(F("Robust parameter parser: comma/space/case/quotes OK"));
   Serial.println(F("OLED console mode enabled"));
-
-  if (!ok) {
-    setErr("-300,\"RX buffer allocation failed\"");
-    oledConsolePush("<", "RX alloc fail");
-  }
-
+  if (!ok) { setErr("-300,\"RX buffer allocation failed\""); oledConsolePush("<", "RX alloc fail"); }
   initI2c();
+  Serial.print(F("MCP ready: ")); Serial.print(mcpReadyCount()); Serial.print('/'); Serial.println(MCP23017_COUNT);
+  Serial.print(F("MCP mask: 0x")); Serial.println(mcpReadyMask(), HEX);
+  for (int i = 0; i < MCP23017_COUNT; i++) {
+    Serial.print(F("MCP")); Serial.print(i); Serial.print(F(" addr 0x")); Serial.print(mcpAddr[i], HEX);
+    Serial.println(mcpReady[i] ? F(" OK") : F(" NO"));
+  }
   initW5500();
-
-  Serial.print(F("Ethernet IP: "));
-  Serial.println(Ethernet.localIP());
+  Serial.print(F("Ethernet IP: ")); Serial.println(Ethernet.localIP());
   Serial.println(F("USB Serial and TCP/5025 enabled"));
-  Serial.println(F("Send HELP? MEM? PARSE?"));
-
+  Serial.println(F("Send HELP? MEM? MCP:STAT?"));
   xTaskCreatePinnedToCore(taskSerial, "scpi_serial", TASK_STACK_SERIAL, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(taskEthernet, "scpi_eth", TASK_STACK_ETH, nullptr, 2, nullptr, 1);
   xTaskCreatePinnedToCore(taskOled, "oled", TASK_STACK_OLED, nullptr, 1, nullptr, 1);
