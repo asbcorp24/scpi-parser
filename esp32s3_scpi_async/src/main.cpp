@@ -9,8 +9,8 @@
 #include "config.h"
 
 #define MAX_SCPI_PARAMS 24
-#define OLED_CMD_TEXT_LEN 32
-#define OLED_RES_TEXT_LEN 32
+#define OLED_CONSOLE_LINES 7
+#define OLED_CONSOLE_COLS 22
 
 class EthernetServerCompat : public EthernetServer {
 public:
@@ -51,8 +51,7 @@ bool psramReady = false;
 IPAddress currentIp(0, 0, 0, 0);
 char lastError[96] = "0,\"No error\"";
 char lastSource[8] = "boot";
-char lastOledCmd[OLED_CMD_TEXT_LEN] = "boot";
-char lastOledRes[OLED_RES_TEXT_LEN] = "ready";
+char oledConsole[OLED_CONSOLE_LINES][OLED_CONSOLE_COLS];
 uint32_t serialCount = 0;
 uint32_t ethCount = 0;
 uint32_t overflowCount = 0;
@@ -70,16 +69,27 @@ static void safeCopy(char *dst, size_t dstSize, const char *src) {
   dst[dstSize - 1] = 0;
 }
 
-static void setOledCmd(const char *cmd) {
+static void oledConsoleClear() {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  safeCopy(lastOledCmd, sizeof(lastOledCmd), cmd);
+  for (int i = 0; i < OLED_CONSOLE_LINES; i++) {
+    oledConsole[i][0] = 0;
+  }
   xSemaphoreGive(stateMutex);
 }
 
-static void setOledRes(const char *res) {
+static void oledConsolePushRaw(const char *text) {
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  safeCopy(lastOledRes, sizeof(lastOledRes), res);
+  for (int i = 0; i < OLED_CONSOLE_LINES - 1; i++) {
+    safeCopy(oledConsole[i], sizeof(oledConsole[i]), oledConsole[i + 1]);
+  }
+  safeCopy(oledConsole[OLED_CONSOLE_LINES - 1], sizeof(oledConsole[OLED_CONSOLE_LINES - 1]), text);
   xSemaphoreGive(stateMutex);
+}
+
+static void oledConsolePush(const char *prefix, const char *text) {
+  char line[OLED_CONSOLE_COLS];
+  snprintf(line, sizeof(line), "%s%s", prefix ? prefix : "", text ? text : "");
+  oledConsolePushRaw(line);
 }
 
 static void setErr(const char *e) {
@@ -92,7 +102,7 @@ static void replyErr(Stream &io, const char *text) {
   char e[96];
   snprintf(e, sizeof(e), "-100,\"%s\"", text);
   setErr(e);
-  setOledRes(e);
+  oledConsolePush("<", e);
   io.println(e);
 }
 
@@ -410,7 +420,7 @@ static void handleGpioMode(char *params, Stream &io) {
   else if (!strcmp(mode, "INPULLUP") || !strcmp(mode, "INPUT_PULLUP") || !strcmp(mode, "PULLUP")) pinMode(pin, INPUT_PULLUP);
   else if (!strcmp(mode, "INPULLDOWN") || !strcmp(mode, "INPUT_PULLDOWN") || !strcmp(mode, "PULLDOWN")) pinMode(pin, INPUT_PULLDOWN);
   else { replyErr(io, "unknown ESP GPIO mode"); return; }
-  setOledRes("OK GPIO MODE");
+  oledConsolePush("<", "OK GPIO MODE");
   io.println(F("OK"));
 }
 
@@ -423,9 +433,9 @@ static void handleGpioWrite(char *params, Stream &io) {
   if (!parseDigital(paramAt(pl, 1), value)) { replyErr(io, "bad GPIO value"); return; }
   pinMode(pin, OUTPUT);
   digitalWrite(pin, value);
-  char res[OLED_RES_TEXT_LEN];
+  char res[OLED_CONSOLE_COLS];
   snprintf(res, sizeof(res), "OK GPIO%d=%d", pin, value ? 1 : 0);
-  setOledRes(res);
+  oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
@@ -436,9 +446,9 @@ static void handleGpioRead(char *params, Stream &io) {
   if (pl.count < 1) { replyErr(io, "GPIO:READ? needs pin"); return; }
   if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
   int v = digitalRead(pin) ? 1 : 0;
-  char res[OLED_RES_TEXT_LEN];
+  char res[OLED_CONSOLE_COLS];
   snprintf(res, sizeof(res), "GPIO%d=%d", pin, v);
-  setOledRes(res);
+  oledConsolePush("<", res);
   io.println(v ? F("1") : F("0"));
 }
 
@@ -451,9 +461,9 @@ static void handleGpioToggle(char *params, Stream &io) {
   pinMode(pin, OUTPUT);
   digitalWrite(pin, !digitalRead(pin));
   int v = digitalRead(pin) ? 1 : 0;
-  char res[OLED_RES_TEXT_LEN];
+  char res[OLED_CONSOLE_COLS];
   snprintf(res, sizeof(res), "OK GPIO%d=%d", pin, v);
-  setOledRes(res);
+  oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
@@ -479,9 +489,9 @@ static void handleMcpMode(char *params, Stream &io) {
     return;
   }
   xSemaphoreGive(i2cMutex);
-  char res[OLED_RES_TEXT_LEN];
+  char res[OLED_CONSOLE_COLS];
   snprintf(res, sizeof(res), "OK MCP%d MODE", pin);
-  setOledRes(res);
+  oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
@@ -498,9 +508,9 @@ static void handleMcpWrite(char *params, Stream &io) {
   mcp.pinMode(pin, OUTPUT);
   mcp.digitalWrite(pin, value);
   xSemaphoreGive(i2cMutex);
-  char res[OLED_RES_TEXT_LEN];
+  char res[OLED_CONSOLE_COLS];
   snprintf(res, sizeof(res), "OK MCP%d=%d", pin, value ? 1 : 0);
-  setOledRes(res);
+  oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
@@ -515,9 +525,9 @@ static void handleMcpRead(char *params, Stream &io) {
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
   int v = mcp.digitalRead(pin) ? 1 : 0;
   xSemaphoreGive(i2cMutex);
-  char res[OLED_RES_TEXT_LEN];
+  char res[OLED_CONSOLE_COLS];
   snprintf(res, sizeof(res), "MCP%d=%d", pin, v);
-  setOledRes(res);
+  oledConsolePush("<", res);
   io.println(v ? F("1") : F("0"));
 }
 
@@ -535,25 +545,25 @@ static void handleMcpToggle(char *params, Stream &io) {
   mcp.digitalWrite(pin, !v);
   int nv = mcp.digitalRead(pin) ? 1 : 0;
   xSemaphoreGive(i2cMutex);
-  char res[OLED_RES_TEXT_LEN];
+  char res[OLED_CONSOLE_COLS];
   snprintf(res, sizeof(res), "OK MCP%d=%d", pin, nv);
-  setOledRes(res);
+  oledConsolePush("<", res);
   io.println(F("OK"));
 }
 
 static void handleParseTest(char *params, Stream &io) {
   ParamList pl;
   parseParams(params, pl);
-  char res[OLED_RES_TEXT_LEN];
+  char res[OLED_CONSOLE_COLS];
   snprintf(res, sizeof(res), "PARAMS=%d", pl.count);
-  setOledRes(res);
+  oledConsolePush("<", res);
   printParseResult(pl, io);
 }
 
 static void handleOneCommand(char *cmdLine, Stream &io) {
-  char original[OLED_CMD_TEXT_LEN];
+  char original[OLED_CONSOLE_COLS];
   safeCopy(original, sizeof(original), trim(cmdLine));
-  setOledCmd(original);
+  oledConsolePush(">", original);
 
   char *line = trim(cmdLine);
   stripLiteralEscapesAtEnd(line);
@@ -578,17 +588,18 @@ static void handleOneCommand(char *cmdLine, Stream &io) {
     io.print(DEVICE_MODEL); io.print(',');
     io.print(DEVICE_SERIAL); io.print(',');
     io.println(DEVICE_VERSION);
-    setOledRes("IDN OK");
+    oledConsolePush("<", "IDN OK");
   } else if (!strcmp(line, "*RST")) {
     setErr("0,\"No error\"");
-    setOledRes("RESET OK");
+    oledConsoleClear();
+    oledConsolePush("<", "RESET OK");
     io.println(F("OK"));
   } else if (!strcmp(line, "HELP?")) {
     cmdHelp(io);
-    setOledRes("HELP OK");
+    oledConsolePush("<", "HELP OK");
   } else if (!strcmp(line, "MEM?")) {
     cmdMem(io);
-    setOledRes("MEM OK");
+    oledConsolePush("<", "MEM OK");
   } else if (!strcmp(line, "PARSE?") || !strcmp(line, "SYST:PARSE?")) {
     handleParseTest(params, io);
   } else if (!strcmp(line, "SYST:ERR?") || !strcmp(line, "SYSTEM:ERROR?")) {
@@ -598,18 +609,18 @@ static void handleOneCommand(char *cmdLine, Stream &io) {
     safeCopy(lastError, sizeof(lastError), "0,\"No error\"");
     xSemaphoreGive(stateMutex);
     io.println(e);
-    setOledRes(e);
+    oledConsolePush("<", e);
   } else if (!strcmp(line, "SYST:STAT?") || !strcmp(line, "SYSTEM:STATUS?")) {
     cmdStat(io);
-    setOledRes("STAT OK");
+    oledConsolePush("<", "STAT OK");
   } else if (!strcmp(line, "ETH:IP?") || !strcmp(line, "ETHERNET:IP?")) {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     IPAddress ip = currentIp;
     xSemaphoreGive(stateMutex);
     io.println(ip);
-    char res[OLED_RES_TEXT_LEN];
+    char res[OLED_CONSOLE_COLS];
     snprintf(res, sizeof(res), "IP %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-    setOledRes(res);
+    oledConsolePush("<", res);
   } else if (!strcmp(line, "GPIO:MODE")) {
     handleGpioMode(params, io);
   } else if (!strcmp(line, "GPIO:WRITE")) {
@@ -628,7 +639,7 @@ static void handleOneCommand(char *cmdLine, Stream &io) {
     handleMcpToggle(params, io);
   } else {
     setErr("-113,\"Undefined header\"");
-    setOledRes("-113 Undefined");
+    oledConsolePush("<", "-113 Undefined");
     io.println(F("-113,\"Undefined header\""));
   }
 }
@@ -662,7 +673,7 @@ static void initI2c() {
     oled.setTextColor(SSD1306_WHITE);
     oled.setCursor(0, 0);
     oled.println(F("SCPI GPIO boot"));
-    oled.println(F("cmd/res display"));
+    oled.println(F("console mode"));
     oled.display();
   }
   xSemaphoreGive(i2cMutex);
@@ -753,15 +764,12 @@ void taskOled(void *) {
       xSemaphoreTake(stateMutex, portMAX_DELAY);
       bool er = ethReady;
       bool mr = mcpReady;
-      IPAddress ip = currentIp;
       uint32_t sc = serialCount;
       uint32_t ec = ethCount;
-      char src[8];
-      char cmd[OLED_CMD_TEXT_LEN];
-      char res[OLED_RES_TEXT_LEN];
-      safeCopy(src, sizeof(src), lastSource);
-      safeCopy(cmd, sizeof(cmd), lastOledCmd);
-      safeCopy(res, sizeof(res), lastOledRes);
+      char lines[OLED_CONSOLE_LINES][OLED_CONSOLE_COLS];
+      for (int i = 0; i < OLED_CONSOLE_LINES; i++) {
+        safeCopy(lines[i], sizeof(lines[i]), oledConsole[i]);
+      }
       xSemaphoreGive(stateMutex);
 
       xSemaphoreTake(i2cMutex, portMAX_DELAY);
@@ -769,14 +777,13 @@ void taskOled(void *) {
       oled.setTextSize(1);
       oled.setTextColor(SSD1306_WHITE);
       oled.setCursor(0, 0);
-      oled.print(F("ETH:")); oled.print(er ? F("OK") : F("NO"));
-      oled.print(F(" MCP:")); oled.println(mr ? F("OK") : F("NO"));
-      oled.print(F("IP:")); oled.println(ip);
-      oled.print(F("S:")); oled.print(sc);
-      oled.print(F(" E:")); oled.print(ec);
-      oled.print(F(" ")); oled.println(src);
-      oled.print(F("CMD:")); oled.println(cmd);
-      oled.print(F("RES:")); oled.println(res);
+      oled.print(F("E:")); oled.print(er ? F("OK") : F("NO"));
+      oled.print(F(" M:")); oled.print(mr ? F("OK") : F("NO"));
+      oled.print(F(" U:")); oled.print(sc);
+      oled.print(F(" T:")); oled.println(ec);
+      for (int i = 0; i < OLED_CONSOLE_LINES; i++) {
+        oled.println(lines[i]);
+      }
       oled.display();
       xSemaphoreGive(i2cMutex);
     }
@@ -790,6 +797,8 @@ void setup() {
 
   i2cMutex = xSemaphoreCreateMutex();
   stateMutex = xSemaphoreCreateMutex();
+  oledConsoleClear();
+  oledConsolePushRaw("console ready");
 
   psramReady = psramFound() && ESP.getPsramSize() > 0;
 
@@ -803,11 +812,11 @@ void setup() {
   Serial.print(F("PSRAM free: ")); Serial.println(ESP.getFreePsram());
   Serial.print(F("RX buffers allocated: ")); Serial.println(ok ? F("OK") : F("FAIL"));
   Serial.println(F("Robust parameter parser: comma/space/case/quotes OK"));
-  Serial.println(F("OLED shows last CMD and RES"));
+  Serial.println(F("OLED console mode enabled"));
 
   if (!ok) {
     setErr("-300,\"RX buffer allocation failed\"");
-    setOledRes("RX alloc fail");
+    oledConsolePush("<", "RX alloc fail");
   }
 
   initI2c();
