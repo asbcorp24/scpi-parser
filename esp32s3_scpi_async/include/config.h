@@ -33,7 +33,7 @@
 // Device identity
 #define DEVICE_MANUFACTURER "ASBCORP"
 #define DEVICE_MODEL "ESP32S3-SCPI-ASYNC-GPIO"
-#define DEVICE_SERIAL "N16R2"
+#define DEVICE_SERIAL "N8R2"
 #define DEVICE_VERSION "0.2"
 
 // Queue settings
