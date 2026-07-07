@@ -25,7 +25,10 @@
 
 // SCPI over Ethernet
 #define SCPI_TCP_PORT 5025
-#define MAX_ETH_CLIENTS 4
+
+// For long SCPI commands keep only one TCP client by default.
+// Every client gets its own PSRAM RX line buffer.
+#define MAX_ETH_CLIENTS 1
 
 // Network fallback if DHCP fails
 #define USE_STATIC_IP_IF_DHCP_FAIL 1
@@ -34,13 +37,14 @@
 #define DEVICE_MANUFACTURER "ASBCORP"
 #define DEVICE_MODEL "ESP32S3-SCPI-ASYNC-GPIO"
 #define DEVICE_SERIAL "N8R2"
-#define DEVICE_VERSION "0.2"
+#define DEVICE_VERSION "0.3-psram-long-scpi"
 
-// Queue settings
-#define SCPI_QUEUE_LENGTH 16
-#define SCPI_LINE_LENGTH 160
+// Long SCPI command line length.
+// Allocated from PSRAM with heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT).
+// Increase to 8192 if ESP.getFreePsram() is OK.
+#define SCPI_LINE_LENGTH 4096
 
-// Task stack sizes
-#define TASK_STACK_SERIAL 4096
-#define TASK_STACK_ETH 8192
-#define TASK_STACK_OLED 4096
+// Task stack sizes. Command text itself is not stored on task stack.
+#define TASK_STACK_SERIAL 3072
+#define TASK_STACK_ETH 6144
+#define TASK_STACK_OLED 3072
