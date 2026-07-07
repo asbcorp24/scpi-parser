@@ -8,6 +8,8 @@
 #include "esp_heap_caps.h"
 #include "config.h"
 
+#define MAX_SCPI_PARAMS 24
+
 class EthernetServerCompat : public EthernetServer {
 public:
   explicit EthernetServerCompat(uint16_t port) : EthernetServer(port) {}
@@ -22,6 +24,11 @@ struct LineReceiver {
   size_t cap = 0;
   size_t len = 0;
   bool overflow = false;
+};
+
+struct ParamList {
+  char *v[MAX_SCPI_PARAMS];
+  int count;
 };
 
 Adafruit_MCP23X17 mcp;
@@ -88,6 +95,27 @@ static void upperAscii(char *s) {
   }
 }
 
+static void stripLiteralEscapesAtEnd(char *s) {
+  if (!s) return;
+  s = trim(s);
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    size_t n = strlen(s);
+    if (n >= 2 && s[n - 2] == '\\' && (s[n - 1] == 'n' || s[n - 1] == 'N' || s[n - 1] == 'r' || s[n - 1] == 'R')) {
+      s[n - 2] = 0;
+      s = trim(s);
+      changed = true;
+    }
+    n = strlen(s);
+    if (n > 0 && s[n - 1] == ')') {
+      s[n - 1] = 0;
+      s = trim(s);
+      changed = true;
+    }
+  }
+}
+
 static bool parseIntStrict(const char *s, int &out) {
   if (!s) return false;
   while (*s && isspace((unsigned char)*s)) s++;
@@ -101,32 +129,101 @@ static bool parseIntStrict(const char *s, int &out) {
 
 static bool parseDigital(const char *s, int &out) {
   if (!s) return false;
-  char tmp[12];
+  char tmp[16];
   safeCopy(tmp, sizeof(tmp), s);
   char *v = trim(tmp);
   upperAscii(v);
-  if (!strcmp(v, "1") || !strcmp(v, "ON") || !strcmp(v, "HIGH")) {
+  if (!strcmp(v, "1") || !strcmp(v, "ON") || !strcmp(v, "HIGH") || !strcmp(v, "TRUE")) {
     out = HIGH;
     return true;
   }
-  if (!strcmp(v, "0") || !strcmp(v, "OFF") || !strcmp(v, "LOW")) {
+  if (!strcmp(v, "0") || !strcmp(v, "OFF") || !strcmp(v, "LOW") || !strcmp(v, "FALSE")) {
     out = LOW;
     return true;
   }
   return false;
 }
 
-static char *nextParam(char *&p) {
-  if (!p) return nullptr;
-  char *start = p;
-  char *comma = strchr(p, ',');
-  if (comma) {
-    *comma = 0;
-    p = comma + 1;
-  } else {
-    p = nullptr;
+static bool parseFloatStrict(const char *s, float &out) {
+  if (!s) return false;
+  while (*s && isspace((unsigned char)*s)) s++;
+  char *endPtr = nullptr;
+  float v = strtof(s, &endPtr);
+  while (endPtr && isspace((unsigned char)*endPtr)) endPtr++;
+  if (!endPtr || *endPtr != 0) return false;
+  out = v;
+  return true;
+}
+
+static bool isDelimiter(char c) {
+  return c == ',' || isspace((unsigned char)c);
+}
+
+static void initParams(ParamList &pl) {
+  pl.count = 0;
+  for (int i = 0; i < MAX_SCPI_PARAMS; i++) pl.v[i] = nullptr;
+}
+
+static int parseParams(char *params, ParamList &pl) {
+  initParams(pl);
+  if (!params) return 0;
+
+  char *p = params;
+  while (*p && pl.count < MAX_SCPI_PARAMS) {
+    while (*p && isDelimiter(*p)) p++;
+    if (!*p) break;
+
+    char *start = nullptr;
+
+    if (*p == '"' || *p == '\'') {
+      char quote = *p;
+      p++;
+      start = p;
+      while (*p && *p != quote) p++;
+      if (*p == quote) {
+        *p = 0;
+        p++;
+      }
+      while (*p && !isDelimiter(*p)) p++;
+      if (*p) {
+        *p = 0;
+        p++;
+      }
+    } else {
+      start = p;
+      while (*p && !isDelimiter(*p)) p++;
+      if (*p) {
+        *p = 0;
+        p++;
+      }
+    }
+
+    start = trim(start);
+    stripLiteralEscapesAtEnd(start);
+    if (*start) {
+      pl.v[pl.count++] = start;
+    }
   }
-  return trim(start);
+
+  return pl.count;
+}
+
+static const char *paramAt(const ParamList &pl, int index) {
+  if (index < 0 || index >= pl.count) return nullptr;
+  return pl.v[index];
+}
+
+static void printParseResult(const ParamList &pl, Stream &io) {
+  io.print(F("PARAMS="));
+  io.print(pl.count);
+  for (int i = 0; i < pl.count; i++) {
+    io.print(F(",P"));
+    io.print(i);
+    io.print(F("=\""));
+    io.print(pl.v[i] ? pl.v[i] : "");
+    io.print(F("\""));
+  }
+  io.println();
 }
 
 static bool isEspPinAllowed(int pin) {
@@ -241,6 +338,7 @@ static void cmdHelp(Stream &io) {
   io.println(F("*RST"));
   io.println(F("HELP?"));
   io.println(F("MEM?"));
+  io.println(F("PARSE? p0,p1,p2"));
   io.println(F("SYST:ERR?"));
   io.println(F("SYST:STAT?"));
   io.println(F("ETH:IP?"));
@@ -252,7 +350,8 @@ static void cmdHelp(Stream &io) {
   io.println(F("MCP:WRITE 0..15,0|1|ON|OFF|HIGH|LOW"));
   io.println(F("MCP:READ? 0..15"));
   io.println(F("MCP:TOGGLE 0..15"));
-  io.println(F("Batch example: GPIO:WRITE 5,1;MCP:WRITE 0,1;MEM?"));
+  io.println(F("Accepted params: comma or spaces, any case, extra spaces, quoted text"));
+  io.println(F("Example: gpio:write  5 , on ; mcp:write 0 off ; mem?"));
 }
 
 static void cmdStat(Stream &io) {
@@ -279,50 +378,51 @@ static void cmdStat(Stream &io) {
 }
 
 static void handleGpioMode(char *params, Stream &io) {
-  char *p = params;
-  char *a = nextParam(p);
-  char *b = nextParam(p);
+  ParamList pl;
+  parseParams(params, pl);
   int pin;
-  if (!a || !b) { replyErr(io, "GPIO:MODE needs pin,mode"); return; }
-  if (!parseEspPin(a, pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
-  upperAscii(b);
+  if (pl.count < 2) { replyErr(io, "GPIO:MODE needs pin,mode"); return; }
+  if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
 
-  if (!strcmp(b, "OUT") || !strcmp(b, "OUTPUT")) pinMode(pin, OUTPUT);
-  else if (!strcmp(b, "IN") || !strcmp(b, "INPUT")) pinMode(pin, INPUT);
-  else if (!strcmp(b, "INPULLUP") || !strcmp(b, "INPUT_PULLUP") || !strcmp(b, "PULLUP")) pinMode(pin, INPUT_PULLUP);
-  else if (!strcmp(b, "INPULLDOWN") || !strcmp(b, "INPUT_PULLDOWN") || !strcmp(b, "PULLDOWN")) pinMode(pin, INPUT_PULLDOWN);
+  char mode[24];
+  safeCopy(mode, sizeof(mode), paramAt(pl, 1));
+  upperAscii(mode);
+
+  if (!strcmp(mode, "OUT") || !strcmp(mode, "OUTPUT")) pinMode(pin, OUTPUT);
+  else if (!strcmp(mode, "IN") || !strcmp(mode, "INPUT")) pinMode(pin, INPUT);
+  else if (!strcmp(mode, "INPULLUP") || !strcmp(mode, "INPUT_PULLUP") || !strcmp(mode, "PULLUP")) pinMode(pin, INPUT_PULLUP);
+  else if (!strcmp(mode, "INPULLDOWN") || !strcmp(mode, "INPUT_PULLDOWN") || !strcmp(mode, "PULLDOWN")) pinMode(pin, INPUT_PULLDOWN);
   else { replyErr(io, "unknown ESP GPIO mode"); return; }
   io.println(F("OK"));
 }
 
 static void handleGpioWrite(char *params, Stream &io) {
-  char *p = params;
-  char *a = nextParam(p);
-  char *b = nextParam(p);
+  ParamList pl;
+  parseParams(params, pl);
   int pin, value;
-  if (!a || !b) { replyErr(io, "GPIO:WRITE needs pin,value"); return; }
-  if (!parseEspPin(a, pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
-  if (!parseDigital(b, value)) { replyErr(io, "bad GPIO value"); return; }
+  if (pl.count < 2) { replyErr(io, "GPIO:WRITE needs pin,value"); return; }
+  if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
+  if (!parseDigital(paramAt(pl, 1), value)) { replyErr(io, "bad GPIO value"); return; }
   pinMode(pin, OUTPUT);
   digitalWrite(pin, value);
   io.println(F("OK"));
 }
 
 static void handleGpioRead(char *params, Stream &io) {
-  char *p = params;
-  char *a = nextParam(p);
+  ParamList pl;
+  parseParams(params, pl);
   int pin;
-  if (!a) { replyErr(io, "GPIO:READ? needs pin"); return; }
-  if (!parseEspPin(a, pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
+  if (pl.count < 1) { replyErr(io, "GPIO:READ? needs pin"); return; }
+  if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
   io.println(digitalRead(pin) ? F("1") : F("0"));
 }
 
 static void handleGpioToggle(char *params, Stream &io) {
-  char *p = params;
-  char *a = nextParam(p);
+  ParamList pl;
+  parseParams(params, pl);
   int pin;
-  if (!a) { replyErr(io, "GPIO:TOGGLE needs pin"); return; }
-  if (!parseEspPin(a, pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
+  if (pl.count < 1) { replyErr(io, "GPIO:TOGGLE needs pin"); return; }
+  if (!parseEspPin(paramAt(pl, 0), pin)) { replyErr(io, "bad/protected ESP GPIO pin"); return; }
   pinMode(pin, OUTPUT);
   digitalWrite(pin, !digitalRead(pin));
   io.println(F("OK"));
@@ -330,18 +430,20 @@ static void handleGpioToggle(char *params, Stream &io) {
 
 static void handleMcpMode(char *params, Stream &io) {
   if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  char *p = params;
-  char *a = nextParam(p);
-  char *b = nextParam(p);
+  ParamList pl;
+  parseParams(params, pl);
   int pin;
-  if (!a || !b) { replyErr(io, "MCP:MODE needs pin,mode"); return; }
-  if (!parseMcpPin(a, pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
-  upperAscii(b);
+  if (pl.count < 2) { replyErr(io, "MCP:MODE needs pin,mode"); return; }
+  if (!parseMcpPin(paramAt(pl, 0), pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
+
+  char mode[24];
+  safeCopy(mode, sizeof(mode), paramAt(pl, 1));
+  upperAscii(mode);
 
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  if (!strcmp(b, "OUT") || !strcmp(b, "OUTPUT")) mcp.pinMode(pin, OUTPUT);
-  else if (!strcmp(b, "IN") || !strcmp(b, "INPUT")) mcp.pinMode(pin, INPUT);
-  else if (!strcmp(b, "INPULLUP") || !strcmp(b, "INPUT_PULLUP") || !strcmp(b, "PULLUP")) mcp.pinMode(pin, INPUT_PULLUP);
+  if (!strcmp(mode, "OUT") || !strcmp(mode, "OUTPUT")) mcp.pinMode(pin, OUTPUT);
+  else if (!strcmp(mode, "IN") || !strcmp(mode, "INPUT")) mcp.pinMode(pin, INPUT);
+  else if (!strcmp(mode, "INPULLUP") || !strcmp(mode, "INPUT_PULLUP") || !strcmp(mode, "PULLUP")) mcp.pinMode(pin, INPUT_PULLUP);
   else {
     xSemaphoreGive(i2cMutex);
     replyErr(io, "unknown MCP mode");
@@ -353,13 +455,12 @@ static void handleMcpMode(char *params, Stream &io) {
 
 static void handleMcpWrite(char *params, Stream &io) {
   if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  char *p = params;
-  char *a = nextParam(p);
-  char *b = nextParam(p);
+  ParamList pl;
+  parseParams(params, pl);
   int pin, value;
-  if (!a || !b) { replyErr(io, "MCP:WRITE needs pin,value"); return; }
-  if (!parseMcpPin(a, pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
-  if (!parseDigital(b, value)) { replyErr(io, "bad MCP value"); return; }
+  if (pl.count < 2) { replyErr(io, "MCP:WRITE needs pin,value"); return; }
+  if (!parseMcpPin(paramAt(pl, 0), pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
+  if (!parseDigital(paramAt(pl, 1), value)) { replyErr(io, "bad MCP value"); return; }
 
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
   mcp.pinMode(pin, OUTPUT);
@@ -370,11 +471,11 @@ static void handleMcpWrite(char *params, Stream &io) {
 
 static void handleMcpRead(char *params, Stream &io) {
   if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  char *p = params;
-  char *a = nextParam(p);
+  ParamList pl;
+  parseParams(params, pl);
   int pin;
-  if (!a) { replyErr(io, "MCP:READ? needs pin"); return; }
-  if (!parseMcpPin(a, pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
+  if (pl.count < 1) { replyErr(io, "MCP:READ? needs pin"); return; }
+  if (!parseMcpPin(paramAt(pl, 0), pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
 
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
   int v = mcp.digitalRead(pin);
@@ -384,11 +485,11 @@ static void handleMcpRead(char *params, Stream &io) {
 
 static void handleMcpToggle(char *params, Stream &io) {
   if (!mcpReady) { replyErr(io, "MCP23017 not initialized"); return; }
-  char *p = params;
-  char *a = nextParam(p);
+  ParamList pl;
+  parseParams(params, pl);
   int pin;
-  if (!a) { replyErr(io, "MCP:TOGGLE needs pin"); return; }
-  if (!parseMcpPin(a, pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
+  if (pl.count < 1) { replyErr(io, "MCP:TOGGLE needs pin"); return; }
+  if (!parseMcpPin(paramAt(pl, 0), pin)) { replyErr(io, "bad MCP pin, use 0..15"); return; }
 
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
   mcp.pinMode(pin, OUTPUT);
@@ -398,16 +499,25 @@ static void handleMcpToggle(char *params, Stream &io) {
   io.println(F("OK"));
 }
 
+static void handleParseTest(char *params, Stream &io) {
+  ParamList pl;
+  parseParams(params, pl);
+  printParseResult(pl, io);
+}
+
 static void handleOneCommand(char *cmdLine, Stream &io) {
   char *line = trim(cmdLine);
+  stripLiteralEscapesAtEnd(line);
   if (!line || !*line) return;
 
   char *params = line;
-  while (*params && !isspace((unsigned char)*params)) params++;
+  while (*params && !isspace((unsigned char)*params) && *params != '(') params++;
   if (*params) {
+    char ender = *params;
     *params = 0;
     params++;
     params = trim(params);
+    if (ender == '(') stripLiteralEscapesAtEnd(params);
   } else {
     params = nullptr;
   }
@@ -426,6 +536,8 @@ static void handleOneCommand(char *cmdLine, Stream &io) {
     cmdHelp(io);
   } else if (!strcmp(line, "MEM?")) {
     cmdMem(io);
+  } else if (!strcmp(line, "PARSE?") || !strcmp(line, "SYST:PARSE?")) {
+    handleParseTest(params, io);
   } else if (!strcmp(line, "SYST:ERR?") || !strcmp(line, "SYSTEM:ERROR?")) {
     xSemaphoreTake(stateMutex, portMAX_DELAY);
     char e[96];
@@ -465,8 +577,6 @@ static void handleOneCommand(char *cmdLine, Stream &io) {
 static void handleScpiLine(char *line, Stream &io, bool eth) {
   incCounter(eth, eth ? "ETH" : "USB");
 
-  // Supports semicolon-separated command batches in one long SCPI line:
-  // GPIO:WRITE 5,1;MCP:WRITE 0,1;MEM?
   char *part = line;
   while (part && *part) {
     char *sep = strchr(part, ';');
@@ -493,7 +603,7 @@ static void initI2c() {
     oled.setTextColor(SSD1306_WHITE);
     oled.setCursor(0, 0);
     oled.println(F("SCPI GPIO boot"));
-    oled.println(F("long cmd PSRAM"));
+    oled.println(F("robust params"));
     oled.display();
   }
   xSemaphoreGive(i2cMutex);
@@ -543,7 +653,7 @@ static void acceptClient() {
       resetLine(ethRx[i]);
       ethClients[i].println(F("ESP32-S3 SCPI TCP ready"));
       ethClients[i].println(F("Long commands use PSRAM buffer"));
-      ethClients[i].println(F("Send HELP? or MEM?"));
+      ethClients[i].println(F("Send HELP? MEM? PARSE?"));
       return;
     }
   }
@@ -629,6 +739,7 @@ void setup() {
   Serial.print(F("PSRAM size: ")); Serial.println(ESP.getPsramSize());
   Serial.print(F("PSRAM free: ")); Serial.println(ESP.getFreePsram());
   Serial.print(F("RX buffers allocated: ")); Serial.println(ok ? F("OK") : F("FAIL"));
+  Serial.println(F("Robust parameter parser: comma/space/case/quotes OK"));
 
   if (!ok) {
     setErr("-300,\"RX buffer allocation failed\"");
@@ -640,7 +751,7 @@ void setup() {
   Serial.print(F("Ethernet IP: "));
   Serial.println(Ethernet.localIP());
   Serial.println(F("USB Serial and TCP/5025 enabled"));
-  Serial.println(F("Send HELP? or MEM?"));
+  Serial.println(F("Send HELP? MEM? PARSE?"));
 
   xTaskCreatePinnedToCore(taskSerial, "scpi_serial", TASK_STACK_SERIAL, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(taskEthernet, "scpi_eth", TASK_STACK_ETH, nullptr, 2, nullptr, 1);
