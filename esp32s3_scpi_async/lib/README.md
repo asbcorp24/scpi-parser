@@ -2,7 +2,7 @@
 
 This project is configured for offline/local-library builds.
 
-`platformio.ini` intentionally does not use `lib_deps`, so PlatformIO will not download Arduino libraries during build.
+`platformio.ini` intentionally does not use `lib_deps`, so PlatformIO will not download Arduino libraries during normal builds.
 
 Required folders inside this `lib/` directory:
 
@@ -22,16 +22,36 @@ lib/Vrekrer SCPI parser
 
 ## Copy from already downloaded PlatformIO libraries
 
-If the libraries were previously downloaded by PlatformIO, run from `esp32s3_scpi_async/`:
+If the libraries were previously downloaded by PlatformIO, run from Windows CMD:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tools/vendor_libs_from_pio.ps1
+```bat
+cd C:\dev\scpi-parser\esp32s3_scpi_async
+tools\vendor_libs.cmd
 ```
 
-Then commit the copied folders:
+Or from PowerShell:
+
+```powershell
+cd C:\dev\scpi-parser\esp32s3_scpi_async
+powershell -ExecutionPolicy Bypass -File .\tools\vendor_libs.ps1
+```
+
+The script copies libraries from:
+
+```text
+.pio/libdeps/esp32s3_n8r2/
+```
+
+to:
+
+```text
+lib/
+```
+
+Then commit the copied folders if you want the repository to be fully self-contained:
 
 ```bash
-git add lib tools/vendor_libs_from_pio.ps1 platformio.ini
+git add lib tools platformio.ini
 git commit -m "Vendor PlatformIO libraries locally"
 git push
 ```
